@@ -146,8 +146,8 @@ template_is_abstract(template, strict=False)   # reads an unparseable template a
 
 Composition resolves references through this backend, which means an unpinned `{% managed_extends
 "base-email" %}` picks up the **latest** version of that key, draft included — the same rule
-`get_template(key)` follows everywhere else. Pin it with `"base-email[v2]"` (or the equivalent
-`version=2`) when a template has to keep composing against an exact base.
+`get_template(key)` follows everywhere else. Pin it with `version=2` when a template has to keep
+composing against an exact base.
 
 Pinning the *notification* rather than the base is vintasend's job, through
 `requested_template_version` — see
