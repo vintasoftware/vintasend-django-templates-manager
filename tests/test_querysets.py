@@ -5,6 +5,7 @@ from vintasend_django_templates_manager.models import ManagedTemplate, ManagedTe
 from vintasend_django_templates_manager.querysets import (
     ManagedTemplateQuerySet,
     ManagedTemplateTagQuerySet,
+    most_recent_active_version_q,
     normalize_tag_slugs,
 )
 
@@ -41,6 +42,37 @@ def test_get_latest_version_is_reachable_from_a_narrowed_queryset(make_template)
     make_template(key="welcome", version=1)
     assert ManagedTemplate.objects.filter(status="draft").get_latest_version("welcome") is not None
     assert ManagedTemplate.objects.filter(status="active").get_latest_version("welcome") is None
+
+
+def test_most_recent_active_versions_keeps_the_active_and_draft_rows(make_template):
+    make_template(key="live", status="active")
+    make_template(key="drafted", status="draft")
+    make_template(key="retired", status="inactive")
+    make_template(key="filed", status="archived")
+
+    kept = ManagedTemplate.objects.most_recent_active_versions()
+
+    assert sorted(template.key for template in kept) == ["drafted", "live"]
+
+
+def test_most_recent_active_versions_composes_with_a_narrowed_queryset(make_template):
+    make_template(key="live", status="active")
+    make_template(key="drafted", status="draft")
+
+    kept = ManagedTemplate.objects.filter(status="active").most_recent_active_versions()
+
+    assert [template.key for template in kept] == ["live"]
+
+
+def test_most_recent_active_version_q_excludes_a_higher_version_of_the_same_key():
+    """``key`` is unique, so no test can put two versions of one key in the store. The guard
+    against a higher version is asserted on the SQL instead, which is where it lives: a
+    subquery correlated on ``key`` that rejects the row when a higher version exists."""
+    sql = str(ManagedTemplate.objects.filter(most_recent_active_version_q()).query).replace('"', "")
+
+    assert "NOT (EXISTS" in sql
+    assert "U0.key = " in sql
+    assert "U0.version > " in sql
 
 
 def test_get_by_slug_accepts_the_text_behind_the_slug(make_tag):

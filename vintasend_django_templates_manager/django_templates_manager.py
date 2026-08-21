@@ -5,7 +5,7 @@ from enum import Enum
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AbstractUser
 from django.db import transaction
-from django.db.models import Prefetch, Q
+from django.db.models import Q
 
 from vintasend_managed_templates.base_template_manager_backend import BaseTemplateManagerBackend
 from vintasend_managed_templates.constants import ManagedTemplateStatus, ManagedTemplateTagStatus
@@ -48,6 +48,7 @@ from .querysets import (
     ManagedTemplateTagQuerySet,
     all_tags_q,
     any_tags_q,
+    most_recent_active_version_q,
     normalize_tag_slugs,
 )
 
@@ -81,6 +82,9 @@ _RANGE_FIELDS: dict[str, str] = {
 # Tag membership. Both take a collection of slugs rather than a lookup dict, so they are
 # translated by their own branch in ``_field_leaf`` instead of by one of the tables above.
 _TAG_FIELDS: frozenset[str] = frozenset({"includes_all_tags", "includes_any_of_tags"})
+# The one flag field: a bare boolean, and the only filter answered against the key's other
+# versions rather than against a column of the row. Its own branch in ``_field_leaf`` too.
+_MOST_RECENT_ACTIVE_VERSION_FIELD = "most_recent_active_version"
 # order_by field name -> model field. ``created_at`` maps to ``created`` and ``updated_at`` to
 # ``modified``, matching the model's ``AutoCreatedField`` / ``AutoLastModifiedField``.
 _ORDER_FIELD_TO_ATTR: dict[str, str] = {
@@ -204,26 +208,54 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         return self._serialize_template(template)
 
     def update_template(self, template_key: str, data: ManagedTemplateUpdateInput):
-        template = ManagedTemplate.objects.select_for_update().get_latest_version(template_key)
+        """Insert the next version of a key, leaving the version it was copied from alone.
 
-        if template is None:
-            raise ManagedTemplateNotFoundError(
-                f"Template with key '{template_key}' does not exist."
+        A new row, never an edit. A version that is already ACTIVE keeps its content, its
+        status and its history while its successor is drafted, so notifications recorded
+        against it go on rendering exactly what they were sent with -- which is the whole
+        reason templates are versioned rather than updated.
+
+        The new version starts in DRAFT, whatever its predecessor was in, matching the seam's
+        reference implementation: a copy nobody has reviewed should not inherit "published".
+        Activate it when it is ready, and the previous version stays live until you retire it.
+
+        The read and the insert share a transaction, and the previous version is locked for
+        the length of it. Two concurrent updates therefore serialize; if one still races past
+        the lock, the ``(key, version)`` unique constraint rejects the duplicate rather than
+        letting two rows claim the same version number.
+        """
+        with transaction.atomic():
+            previous = ManagedTemplate.objects.select_for_update().get_latest_version(template_key)
+
+            if previous is None:
+                raise ManagedTemplateNotFoundError(
+                    f"Template with key '{template_key}' does not exist."
+                )
+
+            # Resolved before the insert so an unusable tag text fails the whole update
+            # rather than leaving a new version behind with the wrong labels.
+            tags = (
+                list(previous.tags.all())
+                if data.tags is None
+                else self._resolve_tags(data.tags, previous.tenant)
             )
 
-        template.version += 1
-        template.name = data.name or template.name
-        template.description = data.description or template.description
-        template.body_template = data.template_body or template.body_template
-        template.subject_template = data.template_subject or template.subject_template
-        template.preheader_template = data.template_preheader or template.preheader_template
-        with transaction.atomic():
-            template.save()
-            # ``None`` carries the previous version's tags forward -- which here costs nothing,
-            # since this backend bumps the version on the same row rather than inserting a new
-            # one, so the M2M rows are already the ones to keep. ``[]`` clears them.
-            if data.tags is not None:
-                template.tags.set(self._resolve_tags(data.tags, template.tenant))
+            template = ManagedTemplate.objects.create(
+                name=data.name or previous.name,
+                description=data.description or previous.description,
+                key=previous.key,
+                template_managed_backend=previous.template_managed_backend,
+                body_template=data.template_body or previous.body_template,
+                subject_template=data.template_subject or previous.subject_template,
+                preheader_template=data.template_preheader or previous.preheader_template,
+                version=previous.version + 1,
+                status=ManagedTemplateStatus.DRAFT.value,
+                tenant=previous.tenant,
+                # Left unattributed on purpose: ``ManagedTemplateUpdateInput`` carries no
+                # user, and copying the previous version's author would credit this version
+                # to someone who may have had nothing to do with it.
+            )
+            template.tags.set(tags)
         return self._serialize_template(template)
 
     def delete_template(self, template_key: str, version: int | None = None) -> None:
@@ -287,38 +319,42 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
             template.save(update_fields=["status"])
 
     def get_template_status_history(self, template_key: str, version: int | None = None):
-        template: ManagedTemplate | None
+        """The status trail of one version, or of every version of the key, newest first.
 
+        Omitting ``version`` reads the *key's* whole trail rather than its latest version's:
+        each version carries its own records, so anything narrower would quietly drop the
+        history of the versions still serving older notifications.
+        """
+        versions = ManagedTemplate.objects.filter(key=template_key)
         if version is not None:
-            try:
-                template = ManagedTemplate.objects.prefetch_related(
-                    Prefetch(
-                        "history", ManagedTemplateStatusRecord.objects.all().order_by("-created")
-                    )
-                ).get(key=template_key, version=version)
-            except ManagedTemplate.DoesNotExist as e:
+            versions = versions.filter(version=version)
+
+        if not versions.exists():
+            if version is not None:
                 raise ManagedTemplateNotFoundError(
                     f"Template with key '{template_key}' and version '{version}' does not exist."
-                ) from e
-        else:
-            template = ManagedTemplate.objects.get_latest_version(template_key)
-
-        if not template:
+                )
             raise ManagedTemplateNotFoundError(
                 f"Template with key '{template_key}' does not exist."
             )
 
-        status_history = template.history.all()
+        records = (
+            ManagedTemplateStatusRecord.objects.filter(template__in=versions)
+            .select_related("template", "created_by")
+            # ``-id`` breaks a tie between records written in the same transaction, which
+            # share a timestamp to the microsecond often enough to matter under a frozen clock.
+            .order_by("-created", "-id")
+        )
         return [
             ManagedTemplateStatusHistory(
-                template_key=template.key,
-                version=template.version,
+                template_key=record.template.key,
+                version=record.template.version,
                 status=ManagedTemplateStatus(record.status),
                 created=record.created,
                 created_by=str(record.created_by.pk) if record.created_by else None,
                 tenant=record.tenant,
             )
-            for record in status_history
+            for record in records
         ]
 
     # ------------------------------------------------------------------
@@ -552,6 +588,13 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         """Positive Q for one field filter, plus the model field to OR ``__isnull`` on when
         this leaf is negated. Returns the match-nothing Q (and no null field) for an unknown
         field, mirroring the reference evaluator's "unknown field never matches"."""
+        if field == _MOST_RECENT_ACTIVE_VERSION_FIELD:
+            # ``False`` is the complement, not "no filter": it asks for the rows the ``True``
+            # filter leaves behind -- older versions, and every version of a key whose
+            # versions are all retired. No null field, since nothing here reads a column that
+            # could be NULL.
+            current = most_recent_active_version_q()
+            return (current if value else ~current), None
         if field in _TAG_FIELDS:
             # No null field to report: tag membership is a subquery on the through table, and
             # a template with no tags is simply absent from it. There is no NULL to fold in
@@ -663,9 +706,12 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         return self._serialize_template_queryset(self._filtered_queryset(filters, order_by))
 
     def get_paginated_templates(self, page: int, page_size: int):
+        # Ordered even though the seam asks for none: a key has a row per version, so an
+        # unordered offset page is free to return a row twice and skip another. The default
+        # matches ``_filtered_queryset``'s, id-tiebroken for rows that share a timestamp.
         return self._serialize_template_queryset(
             self._paginate_queryset(
-                ManagedTemplate.objects.all(),
+                ManagedTemplate.objects.order_by("-created", "-id"),
                 page=page,
                 page_size=page_size,
             )

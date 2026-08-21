@@ -9,6 +9,7 @@ from vintasend_django_templates_manager.contants import (
     ManagedTemplateTagStatusChoices,
 )
 from vintasend_django_templates_manager.models import (
+    ManagedTemplate,
     ManagedTemplateStatusRecord,
     ManagedTemplateTag,
 )
@@ -24,8 +25,8 @@ def test_makemigrations_has_no_pending_changes(db):
     call_command("makemigrations", "--check", "--dry-run", verbosity=0)
 
 
-def test_template_str_is_the_name(make_template):
-    assert str(make_template(name="Password reset")) == "Password reset"
+def test_template_str_names_the_template_and_its_version(make_template):
+    assert str(make_template(name="Password reset", version=2)) == "Password reset (v2)"
 
 
 def test_status_record_str_identifies_template_version_and_status(make_template):
@@ -68,13 +69,31 @@ def test_deleting_a_template_cascades_to_its_history(make_template):
     assert ManagedTemplateStatusRecord.objects.count() == 0
 
 
-def test_key_is_unique_so_versions_cannot_coexist(make_template):
-    """``key`` is ``unique=True`` while the model also carries a ``version`` column, so a key
-    only ever has one row. ``update_template`` bumps that row in place rather than appending a
-    new version, and ``get_latest_version`` can never have more than one row to choose from."""
+def test_versions_of_one_key_coexist_as_separate_rows(make_template):
+    """A key is a template; a row is one version of it.
+
+    Both rows stand at once because both may be in use: a notification recorded against v1
+    keeps rendering v1 while v2 is drafted, reviewed and published.
+    """
+    first = make_template(key="welcome", version=1, status=ManagedTemplateStatus.ACTIVE.value)
+    second = make_template(key="welcome", version=2)
+
+    assert ManagedTemplate.objects.filter(key="welcome").count() == 2
+    assert first.pk != second.pk
+    assert ManagedTemplate.objects.get(key="welcome", version=1).status == "active"
+
+
+def test_a_version_number_cannot_repeat_within_a_key(make_template):
+    """(key, version) is the row's identity, so a duplicate is a database error, not a
+    second row nothing can tell apart."""
     make_template(key="welcome", version=1)
     with pytest.raises(IntegrityError):
-        make_template(key="welcome", version=2)
+        make_template(key="welcome", version=1)
+
+
+def test_the_same_version_number_is_free_under_another_key(make_template):
+    make_template(key="welcome", version=1)
+    assert make_template(key="receipt", version=1).pk is not None
 
 
 def test_tag_str_is_the_text(make_tag):

@@ -1,8 +1,11 @@
 from typing import TYPE_CHECKING
 
-from django.db.models import Count, Q, QuerySet
+from django.db.models import Count, Exists, OuterRef, Q, QuerySet
 
-from vintasend_managed_templates.constants import ManagedTemplateTagStatus
+from vintasend_managed_templates.constants import (
+    MOST_RECENT_ACTIVE_VERSION_STATUSES,
+    ManagedTemplateTagStatus,
+)
 from vintasend_managed_templates.tags import slugify_tag
 
 
@@ -37,6 +40,14 @@ class ManagedTemplateQuerySet(QuerySet["ManagedTemplate", "ManagedTemplate"]):
         return: ManagedTemplateQuerySet
         """
         return self.filter(any_tags_q(slugs))
+
+    def most_recent_active_versions(self) -> "ManagedTemplateQuerySet":
+        """
+        Narrows to one row per key: its current version.
+
+        return: ManagedTemplateQuerySet
+        """
+        return self.filter(most_recent_active_version_q())
 
 
 def normalize_tag_slugs(tags: object) -> list[str]:
@@ -94,6 +105,29 @@ def all_tags_q(slugs: list[str]) -> Q:
         .values("pk")
     )
     return Q(pk__in=matching)
+
+
+def most_recent_active_version_q() -> Q:
+    """A ``Q`` matching the current version of each key.
+
+    Current means the highest-numbered version whose status is in
+    ``MOST_RECENT_ACTIVE_VERSION_STATUSES`` -- what is published, plus the draft on its way to
+    replacing it. A key whose versions are all INACTIVE or ARCHIVED matches nothing.
+
+    Written as "this row is active or draft, and no active-or-draft row of the same key is
+    numbered higher" rather than as a ``pk IN (... ORDER BY version DESC LIMIT 1)`` subquery:
+    MySQL rejects ``LIMIT`` inside ``IN``, and this form negates cleanly, which the filter
+    translator needs to express ``not {"most_recent_active_version": True}``.
+    """
+    from .models import ManagedTemplate
+
+    statuses = [status.value for status in MOST_RECENT_ACTIVE_VERSION_STATUSES]
+    higher_version = ManagedTemplate.objects.filter(
+        key=OuterRef("key"),
+        status__in=statuses,
+        version__gt=OuterRef("version"),
+    )
+    return Q(status__in=statuses) & ~Q(Exists(higher_version))
 
 
 class ManagedTemplateTagQuerySet(QuerySet["ManagedTemplateTag", "ManagedTemplateTag"]):

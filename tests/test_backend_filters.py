@@ -435,6 +435,83 @@ class TestBareValueFilters:
         assert keys(manager.get_filtered_templates({"version": 2})) == ["beta"]
 
 
+class TestMostRecentActiveVersion:
+    """The ``templates`` fixture is three keys of one version each -- ``alpha`` DRAFT,
+    ``beta`` ACTIVE, ``gamma`` ARCHIVED. The multi-version cases build their own rows.
+    """
+
+    def test_keeps_the_highest_active_or_draft_version_of_a_key(self, manager, make_template):
+        make_template(key="welcome", version=1, status=ManagedTemplateStatus.ACTIVE.value)
+        make_template(key="welcome", version=2, status=ManagedTemplateStatus.DRAFT.value)
+
+        results = manager.get_filtered_templates({"most_recent_active_version": True})
+
+        assert [template.version for template in results] == [2]
+
+    def test_falls_back_to_the_live_version_when_the_newer_one_is_retired(
+        self, manager, make_template
+    ):
+        """v2 is archived, so v1 -- which notifications are still rendering -- is current."""
+        make_template(key="welcome", version=1, status=ManagedTemplateStatus.ACTIVE.value)
+        make_template(key="welcome", version=2, status=ManagedTemplateStatus.ARCHIVED.value)
+
+        results = manager.get_filtered_templates({"most_recent_active_version": True})
+
+        assert [template.version for template in results] == [1]
+
+    def test_false_returns_the_superseded_versions(self, manager, make_template):
+        make_template(key="welcome", version=1, status=ManagedTemplateStatus.ACTIVE.value)
+        make_template(key="welcome", version=2, status=ManagedTemplateStatus.DRAFT.value)
+
+        results = manager.get_filtered_templates({"most_recent_active_version": False})
+
+        assert [template.version for template in results] == [1]
+
+    def test_a_key_with_no_active_or_draft_version_drops_out(self, manager, make_template):
+        make_template(key="welcome", version=1, status=ManagedTemplateStatus.INACTIVE.value)
+        make_template(key="welcome", version=2, status=ManagedTemplateStatus.ARCHIVED.value)
+
+        results = manager.get_filtered_templates({"most_recent_active_version": True})
+
+        assert keys(results) == []
+
+    def test_true_keeps_the_active_and_draft_rows(self, manager, templates):
+        results = manager.get_filtered_templates({"most_recent_active_version": True})
+        assert sorted(keys(results)) == ["alpha", "beta"]
+
+    def test_true_drops_an_inactive_row(self, manager, templates, make_template):
+        make_template(key="delta", version=1, status=ManagedTemplateStatus.INACTIVE.value)
+
+        results = manager.get_filtered_templates({"most_recent_active_version": True})
+
+        assert "delta" not in keys(results)
+
+    def test_false_is_the_complement(self, manager, templates):
+        results = manager.get_filtered_templates({"most_recent_active_version": False})
+        assert keys(results) == ["gamma"]
+
+    def test_negating_true_matches_the_same_rows_as_false(self, manager, templates):
+        negated = manager.get_filtered_templates({"not": {"most_recent_active_version": True}})
+        assert keys(negated) == ["gamma"]
+
+    def test_combines_with_another_field(self, manager, templates):
+        results = manager.get_filtered_templates(
+            {"most_recent_active_version": True, "key": string_lookup("beta")}
+        )
+        assert keys(results) == ["beta"]
+
+    def test_combines_inside_a_logical_group(self, manager, templates):
+        results = manager.get_filtered_templates(
+            {
+                "and": [
+                    {"most_recent_active_version": True},
+                    {"version": {"lookup": "gte", "value": 2}},
+                ]
+            }
+        )
+        assert keys(results) == ["beta"]
+
+
 class TestNegatedUnknownField:
     def test_negating_an_unknown_field_matches_everything(self, manager, templates):
         """An unknown field has no column to test for NULL, so negation falls back to the

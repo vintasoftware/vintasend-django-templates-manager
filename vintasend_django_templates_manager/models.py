@@ -55,9 +55,21 @@ class ManagedTemplateTag(models.Model):
 
 
 class ManagedTemplate(models.Model):
+    """One **version** of a template. A key has as many rows as it has versions.
+
+    Several versions of one key can be live at once, and that is the point: a notification
+    recorded against v1 keeps rendering v1 after v2 is published, so the two flows never
+    collide. Nothing about a version is edited once it exists --
+    ``DjangoTemplateManager.update_template`` inserts the next one and leaves its predecessor
+    alone -- except its ``status`` and its tags, which are what a version's lifecycle is.
+    """
+
     name = models.CharField(max_length=255)
     description = models.TextField(blank=True)
-    key = models.CharField(max_length=255, unique=True)
+    # Not unique on its own: the key names the *template*, and the (key, version) pair below
+    # names the row. No db_index either -- the unique constraint's index is on (key, version),
+    # whose leftmost column is key, so a lookup by key alone already uses it.
+    key = models.CharField(max_length=255)
     template_managed_backend = models.CharField(max_length=255, db_index=True)
     body_template = models.TextField()
     # NULL is meaningful on the fields below, not interchangeable with "": the
@@ -67,7 +79,7 @@ class ManagedTemplate(models.Model):
     preheader_template = models.TextField(null=True, blank=True)  # noqa: DJ001
     version = models.PositiveIntegerField()
     status = models.CharField(max_length=50)
-    created = models.DateTimeField(auto_now_add=True)
+    created = models.DateTimeField(auto_now_add=True, db_index=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         null=True,
@@ -75,7 +87,7 @@ class ManagedTemplate(models.Model):
         on_delete=models.CASCADE,
         related_name="created_templates",
     )
-    updated = models.DateTimeField(auto_now=True)
+    updated = models.DateTimeField(auto_now=True, db_index=True)
     tenant = models.CharField(max_length=255, null=True, blank=True, db_index=True)  # noqa: DJ001
     # Tags hang off a *version*, not off a key: two versions of one template can be labelled
     # differently, which is what lets a draft be tagged for review without relabelling the
@@ -90,8 +102,21 @@ class ManagedTemplate(models.Model):
 
     history: "RelatedManager[ManagedTemplateStatusRecord]"
 
+    class Meta:
+        constraints = [  # noqa: RUF012 - Django Meta options are not ClassVar-annotated
+            # The row's identity. It is also what makes a concurrent second ``update_template``
+            # fail loudly instead of silently minting a duplicate version number: both
+            # transactions read the same latest version, and only one insert can win.
+            models.UniqueConstraint(
+                fields=("key", "version"),
+                name="vintasend_managed_template_unique_key_version",
+            ),
+        ]
+
     def __str__(self):
-        return self.name
+        # The version is part of the label because it is part of the identity: without it two
+        # versions of one template read identically everywhere Django renders a row by name.
+        return f"{self.name} (v{self.version})"
 
 
 class ManagedTemplateStatusRecord(models.Model):

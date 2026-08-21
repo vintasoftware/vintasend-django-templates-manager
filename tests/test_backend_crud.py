@@ -184,8 +184,9 @@ class TestUpdateTemplate:
         assert updated.subject_template == "New subject"
         assert updated.preheader_template == "New preheader"
 
-    def test_writes_through_to_the_database(self, manager, make_template):
-        template = make_template(key="welcome", version=1, name="Old")
+    def test_inserts_a_row_and_leaves_the_previous_version_untouched(self, manager, make_template):
+        previous = make_template(key="welcome", version=1, name="Old")
+
         manager.update_template(
             "welcome",
             ManagedTemplateUpdateInput(
@@ -196,8 +197,30 @@ class TestUpdateTemplate:
                 template_preheader=None,
             ),
         )
-        template.refresh_from_db()
-        assert (template.name, template.version) == ("New", 2)
+
+        previous.refresh_from_db()
+        assert (previous.name, previous.version) == ("Old", 1)
+        rows = ManagedTemplate.objects.filter(key="welcome").order_by("version")
+        assert [(row.name, row.version) for row in rows] == [("Old", 1), ("New", 2)]
+
+    def test_both_versions_stay_readable_by_number(self, manager, make_template):
+        """The reason versions are rows: a notification holding v1 must keep rendering v1."""
+        make_template(key="welcome", version=1, body_template="v1 body")
+
+        manager.update_template(
+            "welcome",
+            ManagedTemplateUpdateInput(
+                name=None,
+                description=None,
+                template_body="v2 body",
+                template_subject=None,
+                template_preheader=None,
+            ),
+        )
+
+        assert manager.get_template("welcome", 1).body_template == "v1 body"
+        assert manager.get_template("welcome", 2).body_template == "v2 body"
+        assert manager.get_template("welcome").version == 2
 
     def test_none_fields_keep_their_current_values(self, manager, make_template):
         make_template(key="welcome", name="Kept", description="Kept too", body_template="Body")
@@ -217,8 +240,16 @@ class TestUpdateTemplate:
         assert updated.description == "Kept too"
         assert updated.body_template == "Body"
 
-    def test_leaves_the_status_untouched(self, manager, make_template):
-        make_template(key="welcome", status=ManagedTemplateStatus.ACTIVE.value)
+    def test_the_new_version_starts_as_a_draft_while_the_live_one_stays_active(
+        self, manager, make_template
+    ):
+        """A copy nobody has reviewed does not inherit "published".
+
+        This is what lets a live template be revised safely: v1 goes on serving until v2 is
+        activated deliberately.
+        """
+        live = make_template(key="welcome", status=ManagedTemplateStatus.ACTIVE.value)
+
         updated = manager.update_template(
             "welcome",
             ManagedTemplateUpdateInput(
@@ -229,7 +260,52 @@ class TestUpdateTemplate:
                 template_preheader=None,
             ),
         )
-        assert updated.status is ManagedTemplateStatus.ACTIVE
+
+        assert updated.status is ManagedTemplateStatus.DRAFT
+        live.refresh_from_db()
+        assert live.status == ManagedTemplateStatus.ACTIVE.value
+
+    def test_the_new_version_carries_the_previous_tags_when_none_are_given(
+        self, manager, make_template, make_tag
+    ):
+        previous = make_template(key="welcome", version=1)
+        previous.tags.set([make_tag("Onboarding")])
+
+        updated = manager.update_template(
+            "welcome",
+            ManagedTemplateUpdateInput(
+                name=None,
+                description=None,
+                template_body=None,
+                template_subject=None,
+                template_preheader=None,
+                tags=None,
+            ),
+        )
+
+        assert [tag.slug for tag in updated.tags] == ["onboarding"]
+        # The predecessor keeps its own -- the new row's tags are copies of the links, not a
+        # move of them.
+        assert [tag.slug for tag in previous.tags.all()] == ["onboarding"]
+
+    def test_the_new_version_can_be_created_with_no_tags(self, manager, make_template, make_tag):
+        previous = make_template(key="welcome", version=1)
+        previous.tags.set([make_tag("Onboarding")])
+
+        updated = manager.update_template(
+            "welcome",
+            ManagedTemplateUpdateInput(
+                name=None,
+                description=None,
+                template_body=None,
+                template_subject=None,
+                template_preheader=None,
+                tags=[],
+            ),
+        )
+
+        assert updated.tags == []
+        assert [tag.slug for tag in previous.tags.all()] == ["onboarding"]
 
     def test_raises_for_an_unknown_key(self, manager, db):
         with pytest.raises(ManagedTemplateNotFoundError, match="does not exist"):
@@ -373,6 +449,46 @@ class TestStatusHistory:
         history = manager.get_template_status_history("welcome")
 
         assert [entry.status for entry in history] == [ManagedTemplateStatus.ACTIVE]
+
+    def test_omitting_the_version_reads_the_whole_keys_trail(self, manager, make_template):
+        """Every version keeps its own records, and the key's history is all of them.
+
+        Reading only the latest version's would hide what happened to the versions still
+        rendering for notifications sent before the newest one existed.
+        """
+        first = make_template(key="welcome", version=1)
+        second = make_template(key="welcome", version=2)
+        with freeze_time("2024-01-01 10:00:00"):
+            ManagedTemplateStatusRecord.objects.create(
+                template=first, status=ManagedTemplateStatus.ACTIVE.value
+            )
+        with freeze_time("2024-01-02 10:00:00"):
+            ManagedTemplateStatusRecord.objects.create(
+                template=second, status=ManagedTemplateStatus.DRAFT.value
+            )
+
+        history = manager.get_template_status_history("welcome")
+
+        assert [(entry.version, entry.status) for entry in history] == [
+            (2, ManagedTemplateStatus.DRAFT),
+            (1, ManagedTemplateStatus.ACTIVE),
+        ]
+
+    def test_a_pinned_version_reads_only_its_own_records(self, manager, make_template):
+        first = make_template(key="welcome", version=1)
+        second = make_template(key="welcome", version=2)
+        ManagedTemplateStatusRecord.objects.create(
+            template=first, status=ManagedTemplateStatus.ACTIVE.value
+        )
+        ManagedTemplateStatusRecord.objects.create(
+            template=second, status=ManagedTemplateStatus.DRAFT.value
+        )
+
+        history = manager.get_template_status_history("welcome", 1)
+
+        assert [(entry.version, entry.status) for entry in history] == [
+            (1, ManagedTemplateStatus.ACTIVE)
+        ]
 
     def test_is_empty_before_any_status_change(self, manager, make_template):
         make_template(key="welcome", version=1)
