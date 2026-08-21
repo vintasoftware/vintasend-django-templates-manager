@@ -1262,6 +1262,22 @@ completion = ["argcomplete (>=3.6.3)"]
 testing = ["devpi-process (>=1.1.1)", "pytest (>=9.0.2)", "pytest-mock (>=3.15.1)"]
 
 [[package]]
+name = "tox-gh"
+version = "1.8.0"
+description = "Seamless integration of tox into GitHub Actions."
+optional = false
+python-versions = ">=3.10"
+groups = ["dev"]
+files = [
+    {file = "tox_gh-1.8.0-py3-none-any.whl", hash = "sha256:c29a109dc4c1a51bc472b4989bd7063ac9be07bf0c16a2b0fcbe57f16757e397"},
+    {file = "tox_gh-1.8.0.tar.gz", hash = "sha256:19c151525e6ed383b2fd23f8f3a35301ee12f3438c19ac7062f81c30958626ad"},
+]
+
+[package.dependencies]
+tox = ">=4.31"
+typing-extensions = {version = ">=4.12", markers = "python_version < \"3.12\""}
+
+[[package]]
 name = "types-pyyaml"
 version = "6.0.12.20260815"
 description = "Typing stubs for PyYAML"
@@ -1370,4 +1386,4 @@ typing-extensions = {version = ">=4.13.2", markers = "python_version < \"3.11\""
 [metadata]
 lock-version = "2.1"
 python-versions = "<3.15,>=3.10"
-content-hash = "810c3e4905114f5571adf992c724146c5d09062dd78f2ebaf69fd0131e823ee7"
+content-hash = "cf54ab33ba48e0095c33e30aff1addb0783d40baf9073812ddf6ae63d0521c45"
