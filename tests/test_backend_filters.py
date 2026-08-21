@@ -147,7 +147,7 @@ class TestDateRangeFilters:
             make_template(key="new", name="new")
 
     def _at(self, month):
-        return datetime.datetime(2024, month, 15, tzinfo=datetime.UTC)
+        return datetime.datetime(2024, month, 15, tzinfo=datetime.timezone.utc)
 
     def test_lower_bound_only(self, manager, dated):
         results = manager.get_filtered_templates({"created_at_range": {"from": self._at(3)}})
@@ -406,8 +406,8 @@ class TestTranslationHelpers:
         assert manager._range_q("created", {}) == Q()
 
     def test_a_range_spec_builds_both_bounds(self, manager):
-        lower = datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC)
-        upper = datetime.datetime(2024, 2, 1, tzinfo=datetime.UTC)
+        lower = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        upper = datetime.datetime(2024, 2, 1, tzinfo=datetime.timezone.utc)
         assert manager._range_q("created", {"from": lower, "to": upper}) == (
             Q(created__gte=lower) & Q(created__lte=upper)
         )
@@ -549,5 +549,5 @@ class TestMalformedLookupsAreRejected:
     def test_a_string_field_given_a_date_range(self, manager, templates):
         with pytest.raises(ManagedTemplateInvalidFilterError, match="field name"):
             manager.get_filtered_templates(
-                {"name": {"from": datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC)}}
+                {"name": {"from": datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)}}
             )

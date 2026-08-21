@@ -440,7 +440,7 @@ class TestStatusHistory:
             ManagedTemplateStatus.ACTIVE,
             ManagedTemplateStatus.DRAFT,
         ]
-        assert history[0].created == datetime.datetime(2024, 1, 3, 10, tzinfo=datetime.UTC)
+        assert history[0].created == datetime.datetime(2024, 1, 3, 10, tzinfo=datetime.timezone.utc)
 
     def test_falls_back_to_the_latest_version(self, manager, make_template):
         make_template(key="welcome", version=1)
