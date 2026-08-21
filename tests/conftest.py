@@ -1,10 +1,11 @@
 from django.contrib.auth import get_user_model
 
 import pytest
-from vintasend_managed_templates.constants import ManagedTemplateStatus
+from vintasend_managed_templates.constants import ManagedTemplateStatus, ManagedTemplateTagStatus
+from vintasend_managed_templates.tags import slugify_tag
 
 from vintasend_django_templates_manager.django_templates_manager import DjangoTemplateManager
-from vintasend_django_templates_manager.models import ManagedTemplate
+from vintasend_django_templates_manager.models import ManagedTemplate, ManagedTemplateTag
 
 
 @pytest.fixture
@@ -15,7 +16,9 @@ def manager() -> DjangoTemplateManager:
 @pytest.fixture
 def editor(db):
     return get_user_model().objects.create_user(
-        username="editor", email="editor@example.com", password="pw"  # noqa: S106
+        username="editor",
+        email="editor@example.com",
+        password="pw",  # noqa: S106
     )
 
 
@@ -82,3 +85,38 @@ def string_lookup(value: str, lookup: str = "exact", case_sensitive: bool = True
     """A ``StringFilterLookup``. Bare-string filters are broken (see test_backend_filters),
     so the composition tests build their leaves with this instead."""
     return {"lookup": lookup, "value": value, "case_sensitive": case_sensitive}
+
+
+@pytest.fixture
+def make_tag(db):
+    """Build tag rows directly, bypassing the backend's slugging."""
+
+    def _make(text: str, **overrides) -> ManagedTemplateTag:
+        defaults = {
+            "text": text,
+            "slug": slugify_tag(text),
+            "status": ManagedTemplateTagStatus.ACTIVE.value,
+        }
+        return ManagedTemplateTag.objects.create(**{**defaults, **overrides})
+
+    return _make
+
+
+@pytest.fixture
+def tagged_templates(make_template, make_tag):
+    """Three templates with overlapping tags, for the tag-search cases.
+
+    ``alpha`` and ``beta`` share ``transactional``; only ``alpha`` is also ``onboarding``;
+    ``gamma`` carries no tags at all, which is what the negated cases hinge on.
+    """
+    transactional = make_tag("Transactional")
+    onboarding = make_tag("Onboarding")
+    marketing = make_tag("Marketing")
+
+    alpha = make_template(key="alpha", version=1)
+    beta = make_template(key="beta", version=2)
+    gamma = make_template(key="gamma", version=3)
+
+    alpha.tags.set([transactional, onboarding])
+    beta.tags.set([transactional, marketing])
+    return {"alpha": alpha, "beta": beta, "gamma": gamma}

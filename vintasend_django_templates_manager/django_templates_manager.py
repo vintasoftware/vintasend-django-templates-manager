@@ -8,7 +8,7 @@ from django.db import transaction
 from django.db.models import Prefetch, Q
 
 from vintasend_managed_templates.base_template_manager_backend import BaseTemplateManagerBackend
-from vintasend_managed_templates.constants import ManagedTemplateStatus
+from vintasend_managed_templates.constants import ManagedTemplateStatus, ManagedTemplateTagStatus
 from vintasend_managed_templates.dataclasses import (
     ManagedTemplate as ManagedTemplateDataclass,
 )
@@ -17,10 +17,16 @@ from vintasend_managed_templates.dataclasses import (
     ManagedTemplateStatusHistory,
     ManagedTemplateUpdateInput,
 )
+from vintasend_managed_templates.dataclasses import (
+    ManagedTemplateTag as ManagedTemplateTagDataclass,
+)
 from vintasend_managed_templates.exceptions import (
     ManagedTemplateChangeUserNotFoundError,
     ManagedTemplateInvalidFilterError,
+    ManagedTemplateInvalidTagError,
     ManagedTemplateNotFoundError,
+    ManagedTemplateTagAlreadyExistsError,
+    ManagedTemplateTagNotFoundError,
 )
 from vintasend_managed_templates.filters import (
     ManagedTemplateFilter,
@@ -34,9 +40,16 @@ from vintasend_managed_templates.filters import (
     is_string_membership_exact_lookup,
     is_string_membership_in_lookup,
 )
+from vintasend_managed_templates.tags import next_available_slug, slugify_tag
 
-from .models import ManagedTemplate, ManagedTemplateStatusRecord
-from .querysets import ManagedTemplateQuerySet
+from .models import ManagedTemplate, ManagedTemplateStatusRecord, ManagedTemplateTag
+from .querysets import (
+    ManagedTemplateQuerySet,
+    ManagedTemplateTagQuerySet,
+    all_tags_q,
+    any_tags_q,
+    normalize_tag_slugs,
+)
 
 
 User = get_user_model()
@@ -52,9 +65,7 @@ _MEMBERSHIP_FIELDS: dict[str, str] = {
     "template_managed_backend": "template_managed_backend",
     "key": "key",
 }
-_INTEGER_FIELDS: dict[str, str] = {
-    "version": "version"
-}
+_INTEGER_FIELDS: dict[str, str] = {"version": "version"}
 _STRING_LOOKUP_FIELDS: dict[str, str] = {
     "body_template": "body_template",
     "subject_template": "subject_template",
@@ -67,6 +78,9 @@ _RANGE_FIELDS: dict[str, str] = {
     "created_at_range": "created",
     "updated_at_range": "updated",
 }
+# Tag membership. Both take a collection of slugs rather than a lookup dict, so they are
+# translated by their own branch in ``_field_leaf`` instead of by one of the tables above.
+_TAG_FIELDS: frozenset[str] = frozenset({"includes_all_tags", "includes_any_of_tags"})
 # order_by field name -> model field. ``created_at`` maps to ``created`` and ``updated_at`` to
 # ``modified``, matching the model's ``AutoCreatedField`` / ``AutoLastModifiedField``.
 _ORDER_FIELD_TO_ATTR: dict[str, str] = {
@@ -93,7 +107,6 @@ _FILTER_FIELD_TO_MODEL_FIELD: dict[str, str] = {
 _MATCH_NOTHING = Q(pk__in=[])
 
 
-
 def _and_all(queries: list[Q]) -> Q:
     if not queries:
         return Q()
@@ -105,8 +118,20 @@ def _or_all(queries: list[Q]) -> Q:
         return _MATCH_NOTHING
     return functools.reduce(lambda left, right: left | right, queries)
 
+
 class DjangoTemplateManager(BaseTemplateManagerBackend):
     template_backend_name = "django"
+
+    def _serialize_tag(self, tag: ManagedTemplateTag):
+        return ManagedTemplateTagDataclass(
+            id=tag.pk,
+            text=tag.text,
+            slug=tag.slug,
+            status=ManagedTemplateTagStatus(tag.status),
+            created=tag.created,
+            updated=tag.updated,
+            tenant=tag.tenant,
+        )
 
     def _serialize_template(self, template: ManagedTemplate):
         return ManagedTemplateDataclass(
@@ -123,10 +148,14 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
             tenant=template.tenant,
             created=template.created,
             updated=template.updated,
+            tags=[self._serialize_tag(tag) for tag in template.tags.all()],
         )
 
     def _serialize_template_queryset(self, queryset: ManagedTemplateQuerySet):
-        for template in queryset:
+        # Prefetch rather than let ``template.tags.all()`` fire per row: serialization reads
+        # the tags of every template it is handed, so without this a page of 20 costs 21
+        # queries. Harmless when the caller already prefetched -- Django keeps the first.
+        for template in queryset.prefetch_related("tags"):
             yield self._serialize_template(template)
 
     def _paginate_queryset(
@@ -135,18 +164,24 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         return queryset[((page - 1) * page_size) : ((page - 1) * page_size) + page_size]
 
     def create_template(self, data: ManagedTemplateCreateInput):
-        template = ManagedTemplate.objects.create(
-            name=data.name,
-            description=data.description,
-            key=data.key,
-            template_managed_backend=data.template_managed_backend,
-            body_template=data.template_body,
-            subject_template=data.template_subject,
-            preheader_template=data.template_preheader,
-            tenant=data.tenant,
-            version=1,
-            status=ManagedTemplateStatus.DRAFT.value,
-        )
+        # M2M writes need the row to exist, so tagging is a second statement -- inside the
+        # same transaction as the insert, so an unusable tag rolls the template back rather
+        # than leaving one behind that the caller was told had failed.
+        with transaction.atomic():
+            template = ManagedTemplate.objects.create(
+                name=data.name,
+                description=data.description,
+                key=data.key,
+                template_managed_backend=data.template_managed_backend,
+                body_template=data.template_body,
+                subject_template=data.template_subject,
+                preheader_template=data.template_preheader,
+                tenant=data.tenant,
+                version=1,
+                status=ManagedTemplateStatus.DRAFT.value,
+            )
+            if data.tags:
+                template.tags.set(self._resolve_tags(data.tags, data.tenant))
         return self._serialize_template(template)
 
     def get_template(self, template_key: str, version: int | None = None):
@@ -162,7 +197,9 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
             template = ManagedTemplate.objects.get_latest_version(template_key)
 
         if template is None:
-            raise ManagedTemplateNotFoundError(f"Template with key '{template_key}' does not exist.")
+            raise ManagedTemplateNotFoundError(
+                f"Template with key '{template_key}' does not exist."
+            )
 
         return self._serialize_template(template)
 
@@ -170,7 +207,9 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         template = ManagedTemplate.objects.select_for_update().get_latest_version(template_key)
 
         if template is None:
-            raise ManagedTemplateNotFoundError(f"Template with key '{template_key}' does not exist.")
+            raise ManagedTemplateNotFoundError(
+                f"Template with key '{template_key}' does not exist."
+            )
 
         template.version += 1
         template.name = data.name or template.name
@@ -178,14 +217,22 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         template.body_template = data.template_body or template.body_template
         template.subject_template = data.template_subject or template.subject_template
         template.preheader_template = data.template_preheader or template.preheader_template
-        template.save()
+        with transaction.atomic():
+            template.save()
+            # ``None`` carries the previous version's tags forward -- which here costs nothing,
+            # since this backend bumps the version on the same row rather than inserting a new
+            # one, so the M2M rows are already the ones to keep. ``[]`` clears them.
+            if data.tags is not None:
+                template.tags.set(self._resolve_tags(data.tags, template.tenant))
         return self._serialize_template(template)
 
     def delete_template(self, template_key: str, version: int | None = None) -> None:
         template: ManagedTemplate | None
         if version is not None:
             try:
-                template = ManagedTemplate.objects.select_for_update().get(key=template_key, version=version)
+                template = ManagedTemplate.objects.select_for_update().get(
+                    key=template_key, version=version
+                )
             except ManagedTemplate.DoesNotExist as e:
                 raise ManagedTemplateNotFoundError(
                     f"Template with key '{template_key}' and version {version} does not exist."
@@ -194,7 +241,9 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
             template = ManagedTemplate.objects.select_for_update().get_latest_version(template_key)
 
         if not template:
-            raise ManagedTemplateNotFoundError(f"Template with key '{template_key}' does not exist.")
+            raise ManagedTemplateNotFoundError(
+                f"Template with key '{template_key}' does not exist."
+            )
 
         template.delete()
 
@@ -203,7 +252,7 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         template_key: str,
         version: int,
         status: ManagedTemplateStatus,
-        changed_by: str | None = None
+        changed_by: str | None = None,
     ) -> None:
         user: AbstractUser | None = None
         if changed_by:
@@ -220,7 +269,9 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
                 )
 
         try:
-            template = ManagedTemplate.objects.select_for_update().get(key=template_key, version=version)
+            template = ManagedTemplate.objects.select_for_update().get(
+                key=template_key, version=version
+            )
         except ManagedTemplate.DoesNotExist as e:
             raise ManagedTemplateNotFoundError(
                 f"Template with key '{template_key}' and version '{version}' does not exist."
@@ -235,7 +286,6 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
             template.status = status.value
             template.save(update_fields=["status"])
 
-
     def get_template_status_history(self, template_key: str, version: int | None = None):
         template: ManagedTemplate | None
 
@@ -243,8 +293,7 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
             try:
                 template = ManagedTemplate.objects.prefetch_related(
                     Prefetch(
-                        "history",
-                        ManagedTemplateStatusRecord.objects.all().order_by("-created")
+                        "history", ManagedTemplateStatusRecord.objects.all().order_by("-created")
                     )
                 ).get(key=template_key, version=version)
             except ManagedTemplate.DoesNotExist as e:
@@ -255,7 +304,9 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
             template = ManagedTemplate.objects.get_latest_version(template_key)
 
         if not template:
-            raise ManagedTemplateNotFoundError(f"Template with key '{template_key}' does not exist.")
+            raise ManagedTemplateNotFoundError(
+                f"Template with key '{template_key}' does not exist."
+            )
 
         status_history = template.history.all()
         return [
@@ -270,10 +321,194 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
             for record in status_history
         ]
 
-    def get_all_templates(self):
-        return self._serialize_template_queryset(
-            ManagedTemplate.objects.all()
+    # ------------------------------------------------------------------
+    # Tags
+    # ------------------------------------------------------------------
+
+    def _tag_or_raise(self, slug: str) -> ManagedTemplateTag:
+        """Fetch a tag by slug, accepting the text it was created from as well.
+
+        Slugifying the argument is what makes ``get_tag("Black Friday")`` and
+        ``get_tag("black-friday")`` the same lookup, which is the contract the seam documents.
+        """
+        tag = ManagedTemplateTag.objects.get_by_slug(slug)
+        if tag is None:
+            raise ManagedTemplateTagNotFoundError(f"Tag '{slug}' does not exist.")
+        return tag
+
+    def _slug_or_raise(self, text: str) -> str:
+        slug = slugify_tag(text)
+        if not slug:
+            raise ManagedTemplateInvalidTagError(
+                f"Tag text {text!r} has no characters that can be turned into a slug."
+            )
+        return slug
+
+    def _is_taken(self, slug: str, excluding_pk: int | str | None = None) -> bool:
+        taken = ManagedTemplateTag.objects.filter(slug=slug)
+        if excluding_pk is not None:
+            taken = taken.exclude(pk=excluding_pk)
+        return taken.exists()
+
+    def _resolve_tags(
+        self, texts: Iterable[str], tenant: str | None = None
+    ) -> list[ManagedTemplateTag]:
+        """Model instances for these texts, creating the tags that do not exist yet.
+
+        ``get_or_create`` on the slug rather than on the text, because the slug is the
+        identity: "Black Friday" and "black friday" have to resolve to one row, and only the
+        slug says so.
+        """
+        resolved: list[ManagedTemplateTag] = []
+        seen: set[str] = set()
+        for text in texts:
+            slug = self._slug_or_raise(text)
+            if slug in seen:
+                continue
+            seen.add(slug)
+            # The defaults apply to a create only, so an existing tag keeps its own text,
+            # status and tenant -- re-using an ARCHIVED tag does not quietly revive it.
+            tag, _created = ManagedTemplateTag.objects.get_or_create(
+                slug=slug,
+                defaults={
+                    "text": text,
+                    "status": ManagedTemplateTagStatus.ACTIVE.value,
+                    "tenant": tenant,
+                },
+            )
+            resolved.append(tag)
+        return resolved
+
+    def get_or_create_tags(self, texts: Iterable[str], tenant: str | None = None):
+        with transaction.atomic():
+            return [self._serialize_tag(tag) for tag in self._resolve_tags(texts, tenant)]
+
+    def create_tag(self, text: str, tenant: str | None = None):
+        slug = self._slug_or_raise(text)
+        if self._is_taken(slug):
+            raise ManagedTemplateTagAlreadyExistsError(f"Tag '{slug}' already exists.")
+        tag = ManagedTemplateTag.objects.create(
+            text=text,
+            slug=slug,
+            status=ManagedTemplateTagStatus.ACTIVE.value,
+            tenant=tenant,
         )
+        return self._serialize_tag(tag)
+
+    def get_tag(self, slug: str):
+        return self._serialize_tag(self._tag_or_raise(slug))
+
+    def update_tag(self, slug: str, text: str):
+        """Rename a tag, giving it the slug its new text produces.
+
+        The new slug is uniquified against the other tags, so renaming one tag onto another's
+        text is allowed and yields ``-2``: two tags may legitimately read the same, and the
+        slug is what tells them apart. A tag renamed to a variant of its own text (a case or
+        accent change) keeps its slug rather than gaining a suffix -- it is excluded from its
+        own uniqueness check.
+        """
+        with transaction.atomic():
+            tag = ManagedTemplateTag.objects.select_for_update().get(pk=self._tag_or_raise(slug).pk)
+            tag.text = text
+            tag.slug = next_available_slug(
+                self._slug_or_raise(text),
+                lambda candidate: self._is_taken(candidate, excluding_pk=tag.pk),
+            )
+            tag.save(update_fields=["text", "slug", "updated"])
+        return self._serialize_tag(tag)
+
+    def set_tag_status(self, slug: str, status: ManagedTemplateTagStatus):
+        tag = self._tag_or_raise(slug)
+        tag.status = status.value
+        tag.save(update_fields=["status", "updated"])
+        return self._serialize_tag(tag)
+
+    def delete_tag(self, slug: str) -> None:
+        """Delete a tag. The M2M rows go with it, so every template loses the label.
+
+        No template is deleted and none is otherwise touched -- ``delete()`` on one side of a
+        ManyToMany removes the through rows and nothing else.
+        """
+        self._tag_or_raise(slug).delete()
+
+    def _tag_queryset(
+        self,
+        status: Iterable[ManagedTemplateTagStatus] | None = None,
+        search: str | None = None,
+        tenant: str | None = None,
+    ) -> ManagedTemplateTagQuerySet:
+        queryset = ManagedTemplateTag.objects.all()
+        if status is not None:
+            queryset = queryset.filter(status__in=[s.value for s in status])
+        if search:
+            queryset = queryset.search(search)
+        if tenant is not None:
+            queryset = queryset.filter(tenant=tenant)
+        return queryset
+
+    def get_tags(
+        self,
+        status: Iterable[ManagedTemplateTagStatus] | None = None,
+        search: str | None = None,
+        tenant: str | None = None,
+    ):
+        return [self._serialize_tag(tag) for tag in self._tag_queryset(status, search, tenant)]
+
+    def get_paginated_tags(
+        self,
+        page: int,
+        page_size: int,
+        status: Iterable[ManagedTemplateTagStatus] | None = None,
+        search: str | None = None,
+        tenant: str | None = None,
+    ):
+        """One page of tags. Not part of the seam -- an extra, like ``order_by`` on the
+        filtered-template reads -- for callers paginating a long tag list.
+
+        param page: int -- 1-indexed.
+        param page_size: int
+        return: list[ManagedTemplateTag]
+        """
+        queryset = self._tag_queryset(status, search, tenant)
+        start = (page - 1) * page_size
+        return [self._serialize_tag(tag) for tag in queryset[start : start + page_size]]
+
+    def _template_row(self, template_key: str, version: int | None) -> ManagedTemplate:
+        """The row behind a key/version pair, raising the seam's not-found error."""
+        template: ManagedTemplate | None
+        if version is not None:
+            try:
+                template = ManagedTemplate.objects.get(key=template_key, version=version)
+            except ManagedTemplate.DoesNotExist as e:
+                raise ManagedTemplateNotFoundError(
+                    f"Template with key '{template_key}' and version {version} does not exist."
+                ) from e
+        else:
+            template = ManagedTemplate.objects.get_latest_version(template_key)
+
+        if template is None:
+            raise ManagedTemplateNotFoundError(
+                f"Template with key '{template_key}' does not exist."
+            )
+        return template
+
+    def get_template_tags(self, template_key: str, version: int | None = None):
+        template = self._template_row(template_key, version)
+        return [self._serialize_tag(tag) for tag in template.tags.all()]
+
+    def set_template_tags(self, template_key: str, tags: Iterable[str], version: int | None = None):
+        """Replace one version's tags in place -- no new version, no status change.
+
+        Tags describe how a template is found rather than what it renders, so relabelling one
+        should not fork a version and drop it back to DRAFT.
+        """
+        with transaction.atomic():
+            template = self._template_row(template_key, version)
+            template.tags.set(self._resolve_tags(tags, template.tenant))
+        return self._serialize_template(template)
+
+    def get_all_templates(self):
+        return self._serialize_template_queryset(ManagedTemplate.objects.all())
 
     def get_templates_by_status(self, status: Iterable[ManagedTemplateStatus]):
         """
@@ -317,6 +552,14 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         """Positive Q for one field filter, plus the model field to OR ``__isnull`` on when
         this leaf is negated. Returns the match-nothing Q (and no null field) for an unknown
         field, mirroring the reference evaluator's "unknown field never matches"."""
+        if field in _TAG_FIELDS:
+            # No null field to report: tag membership is a subquery on the through table, and
+            # a template with no tags is simply absent from it. There is no NULL to fold in
+            # under negation the way there is for a nullable column.
+            slugs = normalize_tag_slugs(value)
+            if field == "includes_all_tags":
+                return all_tags_q(slugs), None
+            return any_tags_q(slugs), None
         if isinstance(value, dict):
             # Dispatch on what the FIELD accepts, then check the value's shape. Testing shape
             # first let a lookup meant for one category be captured by another -- a plain
@@ -417,9 +660,7 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         param filters: ManagedTemplateFilter
         return: list[ManagedTemplate]
         """
-        return self._serialize_template_queryset(
-            self._filtered_queryset(filters, order_by)
-        )
+        return self._serialize_template_queryset(self._filtered_queryset(filters, order_by))
 
     def get_paginated_templates(self, page: int, page_size: int):
         return self._serialize_template_queryset(

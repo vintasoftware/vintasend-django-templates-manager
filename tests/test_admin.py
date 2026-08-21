@@ -2,14 +2,21 @@ from django.contrib.admin.sites import site
 from django.urls import reverse
 
 import pytest
-from vintasend_managed_templates.constants import ManagedTemplateStatus
+from vintasend_managed_templates.constants import ManagedTemplateStatus, ManagedTemplateTagStatus
 
 from vintasend_django_templates_manager.admin import (
     ManagedTemplateAdmin,
+    ManagedTemplateAdminForm,
     ManagedTemplateStatusRecordInline,
+    ManagedTemplateTagAdmin,
+    ManagedTemplateTagAdminForm,
     _acting_user,
 )
-from vintasend_django_templates_manager.models import ManagedTemplate, ManagedTemplateStatusRecord
+from vintasend_django_templates_manager.models import (
+    ManagedTemplate,
+    ManagedTemplateStatusRecord,
+    ManagedTemplateTag,
+)
 
 
 @pytest.fixture
@@ -98,7 +105,9 @@ class TestIdentityFieldsAreLocked:
         assert "key" in base_fields
         assert "version" in base_fields
 
-    def test_key_and_version_are_locked_on_change(self, template_admin, request_from, make_template):
+    def test_key_and_version_are_locked_on_change(
+        self, template_admin, request_from, make_template
+    ):
         template = make_template()
         readonly = set(template_admin.get_readonly_fields(request_from(), template))
         assert readonly == {"created", "updated", "key", "version"}
@@ -141,7 +150,9 @@ class TestSaveModelWritesHistory:
 
         assert obj.created_by_id == editor.pk
 
-    def test_changing_the_status_appends_one_record(self, template_admin, request_from, make_template):
+    def test_changing_the_status_appends_one_record(
+        self, template_admin, request_from, make_template
+    ):
         template = make_template(status=ManagedTemplateStatus.DRAFT.value)
         request = request_from()
         form_class = template_admin.get_form(request, template)
@@ -181,7 +192,9 @@ class TestSaveModelWritesHistory:
 
         assert obj.history.get().tenant == "acme"
 
-    def test_a_failed_save_leaves_no_orphan_history(self, template_admin, request_from, db, monkeypatch):
+    def test_a_failed_save_leaves_no_orphan_history(
+        self, template_admin, request_from, db, monkeypatch
+    ):
         """save_model wraps both writes in one transaction, so a failure partway cannot leave a
         status record pointing at a template that was never committed."""
         request = request_from()
@@ -273,8 +286,155 @@ class TestAdminPagesRender:
 
     def test_adding_through_the_admin_creates_the_template_and_its_history(self, admin_client, db):
         url = reverse("admin:vintasend_django_templates_manager_managedtemplate_add")
-        response = admin_client.post(url, form_data(**{"history-TOTAL_FORMS": "0",
-                                                      "history-INITIAL_FORMS": "0"}))
+        response = admin_client.post(
+            url, form_data(**{"history-TOTAL_FORMS": "0", "history-INITIAL_FORMS": "0"})
+        )
         assert response.status_code == 302
         template = ManagedTemplate.objects.get(key="welcome")
         assert template.history.count() == 1
+
+
+# ----------------------------------------------------------------------
+# Tag admin
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def tag_admin():
+    return ManagedTemplateTagAdmin(ManagedTemplateTag, site)
+
+
+def tag_form_data(**overrides):
+    data = {
+        "text": "Black Friday",
+        "status": ManagedTemplateTagStatus.ACTIVE.value,
+        "tenant": "",
+    }
+    return {**data, **overrides}
+
+
+def test_the_tag_admin_is_registered():
+    assert isinstance(site._registry[ManagedTemplateTag], ManagedTemplateTagAdmin)
+
+
+def test_saving_a_tag_derives_its_slug_from_the_text(db):
+    form = ManagedTemplateTagAdminForm(data=tag_form_data())
+
+    assert form.is_valid(), form.errors
+    assert form.save().slug == "black-friday"
+
+
+def test_the_slug_is_not_an_editable_field(tag_admin):
+    """It is the tag's identity and the library owns how it is produced."""
+    assert "slug" not in ManagedTemplateTagAdminForm.Meta.fields
+    assert "slug" in tag_admin.readonly_fields
+
+
+def test_a_tag_whose_text_cannot_be_slugified_is_rejected(db):
+    form = ManagedTemplateTagAdminForm(data=tag_form_data(text="!!!"))
+
+    assert not form.is_valid()
+    assert "text" in form.errors
+
+
+def test_saving_a_tag_onto_a_taken_slug_gets_a_numeric_suffix(db, make_tag):
+    make_tag("Black Friday")
+
+    form = ManagedTemplateTagAdminForm(data=tag_form_data(text="black friday"))
+
+    assert form.is_valid(), form.errors
+    assert form.save().slug == "black-friday-2"
+
+
+def test_renaming_a_tag_through_the_admin_keeps_its_own_slug(db, make_tag):
+    tag = make_tag("Black Friday")
+
+    form = ManagedTemplateTagAdminForm(data=tag_form_data(text="BLACK FRIDAY"), instance=tag)
+
+    assert form.is_valid(), form.errors
+    assert form.save().slug == "black-friday"
+
+
+def test_a_tags_text_is_trimmed_on_save(db):
+    form = ManagedTemplateTagAdminForm(data=tag_form_data(text="  Black   Friday  "))
+
+    assert form.is_valid(), form.errors
+    assert form.save().text == "Black Friday"
+
+
+def test_creating_a_tag_records_the_admin_who_made_it(tag_admin, request_from, admin_user):
+    request = request_from()
+    form = ManagedTemplateTagAdminForm(data=tag_form_data())
+    assert form.is_valid(), form.errors
+    tag = form.save(commit=False)
+
+    tag_admin.save_model(request, tag, form, change=False)
+
+    tag.refresh_from_db()
+    assert tag.created_by_id == admin_user.pk
+
+
+def test_the_template_count_reports_how_many_versions_carry_the_tag(
+    tag_admin, request_from, make_tag, make_template
+):
+    tag = make_tag("Onboarding")
+    for index in range(2):
+        template = make_template(key=f"key-{index}")
+        template.tags.set([tag])
+
+    row = tag_admin.get_queryset(request_from()).get(pk=tag.pk)
+
+    assert tag_admin.template_count(row) == 2
+
+
+def test_the_archive_action_retires_tags_without_touching_their_templates(
+    tag_admin, request_from, make_tag, make_template
+):
+    tag = make_tag("Onboarding")
+    template = make_template()
+    template.tags.set([tag])
+
+    tag_admin.archive_tags(request_from(), ManagedTemplateTag.objects.all())
+
+    tag.refresh_from_db()
+    assert tag.status == ManagedTemplateTagStatus.ARCHIVED.value
+    assert list(template.tags.all()) == [tag]
+
+
+def test_the_restore_action_puts_a_tag_back_on_offer(tag_admin, request_from, make_tag):
+    tag = make_tag("Onboarding", status=ManagedTemplateTagStatus.ARCHIVED.value)
+
+    tag_admin.restore_tags(request_from(), ManagedTemplateTag.objects.all())
+
+    tag.refresh_from_db()
+    assert tag.status == ManagedTemplateTagStatus.ACTIVE.value
+
+
+def test_the_template_admin_lists_a_templates_tags(template_admin, make_template, make_tag):
+    template = make_template()
+    template.tags.set([make_tag("Onboarding"), make_tag("Billing")])
+
+    assert template_admin.tag_list(template) == "Billing, Onboarding"
+
+
+def test_the_template_changelist_does_not_query_tags_per_row(
+    template_admin, request_from, make_template, make_tag, django_assert_num_queries
+):
+    tag = make_tag("Onboarding")
+    for index in range(3):
+        template = make_template(key=f"key-{index}")
+        template.tags.set([tag])
+
+    queryset = template_admin.get_queryset(request_from())
+
+    with django_assert_num_queries(2):
+        [template_admin.tag_list(row) for row in queryset]
+
+
+def test_a_template_can_be_tagged_through_the_admin_form(db, make_tag):
+    tag = make_tag("Onboarding")
+
+    form = ManagedTemplateAdminForm(data=form_data(tags=[tag.pk]))
+
+    assert form.is_valid(), form.errors
+    assert list(form.save().tags.all()) == [tag]

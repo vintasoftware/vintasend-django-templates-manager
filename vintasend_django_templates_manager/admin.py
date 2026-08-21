@@ -3,13 +3,15 @@ from typing import TYPE_CHECKING, Any
 from django import forms
 from django.contrib import admin
 from django.db import transaction
+from django.db.models import Count
 from django.http import HttpRequest
 from django.utils.translation import gettext_lazy as _
 
-from vintasend_managed_templates.constants import ManagedTemplateStatus
+from vintasend_managed_templates.constants import ManagedTemplateStatus, ManagedTemplateTagStatus
+from vintasend_managed_templates.tags import next_available_slug, slugify_tag
 
-from .contants import ManagedTemplateStatusChoices
-from .models import ManagedTemplate, ManagedTemplateStatusRecord
+from .contants import ManagedTemplateStatusChoices, ManagedTemplateTagStatusChoices
+from .models import ManagedTemplate, ManagedTemplateStatusRecord, ManagedTemplateTag
 
 
 if TYPE_CHECKING:
@@ -64,6 +66,7 @@ class ManagedTemplateAdminForm(forms.ModelForm):
             "preheader_template",
             "body_template",
             "status",
+            "tags",
             "tenant",
             "created_by",
         )
@@ -80,15 +83,17 @@ class ManagedTemplateAdmin(admin.ModelAdmin):
         "version",
         "template_managed_backend",
         "status",
+        "tag_list",
         "tenant",
         "created_by",
         "updated",
     )
     list_display_links = ("name", "key")
-    list_filter = ("status", "template_managed_backend", "tenant", "created")
+    list_filter = ("status", "template_managed_backend", "tags", "tenant", "created")
     list_select_related = ("created_by",)
-    search_fields = ("key", "name", "description")
-    search_help_text = _("Search by template key, name or description.")
+    filter_horizontal = ("tags",)
+    search_fields = ("key", "name", "description", "tags__text", "tags__slug")
+    search_help_text = _("Search by template key, name, description or tag.")
     ordering = ("key", "-version")
     date_hierarchy = "created"
     raw_id_fields = ("created_by",)
@@ -96,9 +101,18 @@ class ManagedTemplateAdmin(admin.ModelAdmin):
     fieldsets = (
         (None, {"fields": ("name", "key", "version", "template_managed_backend", "description")}),
         (_("Content"), {"fields": ("subject_template", "preheader_template", "body_template")}),
-        (_("Lifecycle"), {"fields": ("status", "tenant")}),
+        (_("Lifecycle"), {"fields": ("status", "tags", "tenant")}),
         (_("Audit"), {"fields": ("created", "created_by", "updated")}),
     )
+
+    def get_queryset(self, request: HttpRequest):
+        # ``tag_list`` reads every row's tags, so without this the changelist runs one query
+        # per row. Searching across ``tags__*`` also joins, hence the distinct().
+        return super().get_queryset(request).prefetch_related("tags").distinct()
+
+    @admin.display(description=_("tags"))
+    def tag_list(self, obj: ManagedTemplate) -> str:
+        return ", ".join(tag.text for tag in obj.tags.all())
 
     def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> tuple[str, ...]:
         readonly: tuple[str, ...] = ("created", "updated")
@@ -158,3 +172,85 @@ class ManagedTemplateStatusRecordAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request: HttpRequest, obj: Any = None) -> bool:
         return False
+
+
+class ManagedTemplateTagAdminForm(forms.ModelForm):
+    """Keeps ``slug`` derived from ``text`` instead of typed in.
+
+    The slug is the tag's identity -- what filters match and URLs carry -- and
+    ``DjangoTemplateManager`` owns how it is produced. Letting it be edited here would let the
+    admin mint a slug the library would never generate, so it is computed on save and the
+    field is not offered.
+    """
+
+    status = forms.ChoiceField(choices=ManagedTemplateTagStatusChoices.choices, label=_("status"))
+
+    class Meta:
+        model = ManagedTemplateTag
+        fields = ("text", "status", "tenant", "created_by")
+
+    def clean_text(self) -> str:
+        text = " ".join(self.cleaned_data["text"].split())
+        if not slugify_tag(text):
+            raise forms.ValidationError(
+                _("This text has no characters that can be turned into a slug.")
+            )
+        return text
+
+    def save(self, commit: bool = True) -> ManagedTemplateTag:
+        tag: ManagedTemplateTag = super().save(commit=False)
+        tag.slug = next_available_slug(
+            slugify_tag(tag.text),
+            lambda candidate: (
+                ManagedTemplateTag.objects.filter(slug=candidate).exclude(pk=tag.pk).exists()
+            ),
+        )
+        if commit:
+            tag.save()
+        return tag
+
+
+@admin.register(ManagedTemplateTag)
+class ManagedTemplateTagAdmin(admin.ModelAdmin):
+    form = ManagedTemplateTagAdminForm
+
+    list_display = ("text", "slug", "status", "template_count", "tenant", "updated")
+    list_display_links = ("text", "slug")
+    list_filter = ("status", "tenant", "created")
+    list_select_related = ("created_by",)
+    search_fields = ("text", "slug")
+    search_help_text = _("Search by tag text or slug.")
+    ordering = ("text",)
+    raw_id_fields = ("created_by",)
+    readonly_fields = ("slug", "created", "updated")
+    actions = ("archive_tags", "restore_tags")
+
+    fieldsets = (
+        (None, {"fields": ("text", "slug", "status", "tenant")}),
+        (_("Audit"), {"fields": ("created", "created_by", "updated")}),
+    )
+
+    def get_queryset(self, request: HttpRequest):
+        return super().get_queryset(request).annotate(_templates=Count("templates"))
+
+    @admin.display(description=_("templates"), ordering="_templates")
+    def template_count(self, obj: ManagedTemplateTag) -> int:
+        """How many template versions carry this tag -- what a delete would strip the label from."""
+        return obj._templates  # type: ignore[attr-defined]
+
+    def save_model(
+        self, request: HttpRequest, obj: ManagedTemplateTag, form: forms.ModelForm, change: bool
+    ) -> None:
+        user = _acting_user(request)
+        if not change and obj.created_by_id is None:
+            obj.created_by_id = user.pk if user else None
+        super().save_model(request, obj, form, change)
+
+    @admin.action(description=_("Archive selected tags"))
+    def archive_tags(self, request: HttpRequest, queryset: Any) -> None:
+        """Retire tags from the pickers. The templates carrying them keep them."""
+        queryset.update(status=ManagedTemplateTagStatus.ARCHIVED.value)
+
+    @admin.action(description=_("Restore selected tags"))
+    def restore_tags(self, request: HttpRequest, queryset: Any) -> None:
+        queryset.update(status=ManagedTemplateTagStatus.ACTIVE.value)

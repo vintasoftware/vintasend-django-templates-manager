@@ -355,9 +355,7 @@ class TestStatusHistory:
             ("2024-01-03 10:00:00", ManagedTemplateStatus.ARCHIVED),
         ]:
             with freeze_time(moment):
-                ManagedTemplateStatusRecord.objects.create(
-                    template=template, status=status.value
-                )
+                ManagedTemplateStatusRecord.objects.create(template=template, status=status.value)
 
         history = manager.get_template_status_history("welcome", 1)
 

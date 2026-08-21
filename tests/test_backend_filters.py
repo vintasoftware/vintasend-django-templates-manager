@@ -60,10 +60,18 @@ class TestStringLookups:
 
     def test_applies_to_body_and_subject(self, manager, templates):
         assert sorted(
-            keys(manager.get_filtered_templates({"body_template": string_lookup("Hello", "includes")}))
+            keys(
+                manager.get_filtered_templates(
+                    {"body_template": string_lookup("Hello", "includes")}
+                )
+            )
         ) == ["alpha", "beta", "gamma"]
         assert sorted(
-            keys(manager.get_filtered_templates({"subject_template": string_lookup("shared subject")}))
+            keys(
+                manager.get_filtered_templates(
+                    {"subject_template": string_lookup("shared subject")}
+                )
+            )
         ) == ["alpha", "gamma"]
 
     def test_string_lookup_works_on_key(self, manager, templates):
@@ -169,7 +177,12 @@ class TestDateRangeFilters:
 class TestBooleanComposition:
     def test_and_requires_every_branch(self, manager, templates):
         results = manager.get_filtered_templates(
-            {"and": [{"name": string_lookup("name-alpha")}, {"description": string_lookup("Sent on signup")}]}
+            {
+                "and": [
+                    {"name": string_lookup("name-alpha")},
+                    {"description": string_lookup("Sent on signup")},
+                ]
+            }
         )
         assert keys(results) == ["alpha"]
 
@@ -193,7 +206,12 @@ class TestBooleanComposition:
         results = manager.get_filtered_templates(
             {
                 "and": [
-                    {"or": [{"name": string_lookup("name-alpha")}, {"name": string_lookup("name-beta")}]},
+                    {
+                        "or": [
+                            {"name": string_lookup("name-alpha")},
+                            {"name": string_lookup("name-beta")},
+                        ]
+                    },
                     {"description": string_lookup("Sent on signup")},
                 ]
             }
@@ -208,7 +226,12 @@ class TestBooleanComposition:
 
     def test_de_morgan_over_and(self, manager, templates):
         """not (A and B) == (not A) or (not B)."""
-        combined = {"and": [{"name": string_lookup("name-alpha")}, {"subject_template": string_lookup("shared subject")}]}
+        combined = {
+            "and": [
+                {"name": string_lookup("name-alpha")},
+                {"subject_template": string_lookup("shared subject")},
+            ]
+        }
         negated = keys(manager.get_filtered_templates({"not": combined}))
         expanded = keys(
             manager.get_filtered_templates(
@@ -224,7 +247,9 @@ class TestBooleanComposition:
 
     def test_de_morgan_over_or(self, manager, templates):
         """not (A or B) == (not A) and (not B)."""
-        combined = {"or": [{"name": string_lookup("name-alpha")}, {"name": string_lookup("name-beta")}]}
+        combined = {
+            "or": [{"name": string_lookup("name-alpha")}, {"name": string_lookup("name-beta")}]
+        }
         negated = keys(manager.get_filtered_templates({"not": combined}))
         expanded = keys(
             manager.get_filtered_templates(
@@ -276,7 +301,11 @@ class TestEmptyAndUnknownFilters:
         assert keys(manager.get_filtered_templates({"not": {}})) == []
 
     def test_an_empty_and_matches_everything(self, manager, templates):
-        assert sorted(keys(manager.get_filtered_templates({"and": []}))) == ["alpha", "beta", "gamma"]
+        assert sorted(keys(manager.get_filtered_templates({"and": []}))) == [
+            "alpha",
+            "beta",
+            "gamma",
+        ]
 
     def test_an_empty_or_matches_nothing(self, manager, templates):
         assert keys(manager.get_filtered_templates({"or": []})) == []
@@ -285,7 +314,9 @@ class TestEmptyAndUnknownFilters:
         assert keys(manager.get_filtered_templates({"not_a_field": "x"})) == []
 
     def test_an_unrecognised_lookup_dict_is_rejected(self, manager, templates):
-        with pytest.raises(ManagedTemplateInvalidFilterError, match="field name filter is not valid"):
+        with pytest.raises(
+            ManagedTemplateInvalidFilterError, match="field name filter is not valid"
+        ):
             manager.get_filtered_templates({"name": {"bogus": 1}})
 
 
@@ -316,8 +347,12 @@ class TestOrdering:
             for name in ["a", "b", "c"]:
                 make_template(key=name, name=name)
 
-        ascending = keys(manager.get_filtered_templates({}, {"field": "created_at", "direction": "asc"}))
-        descending = keys(manager.get_filtered_templates({}, {"field": "created_at", "direction": "desc"}))
+        ascending = keys(
+            manager.get_filtered_templates({}, {"field": "created_at", "direction": "asc"})
+        )
+        descending = keys(
+            manager.get_filtered_templates({}, {"field": "created_at", "direction": "desc"})
+        )
 
         assert ascending == ["a", "b", "c"]
         assert descending == ["c", "b", "a"]
