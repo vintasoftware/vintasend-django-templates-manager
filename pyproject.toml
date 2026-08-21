@@ -13,9 +13,9 @@ include = [
 [tool.poetry.dependencies]
 python = "<3.15,>=3.12"
 django = "<6.1,>=4.2"
-vintasend = { path = "../..", develop = true }
+vintasend = "3.0.0"
 django-model-utils = "^5.0.0"
-vintasend-managed-templates = { path = "../vintasend-managed-templates", develop = true }
+vintasend-managed-templates = "3.0.0"
 django-stubs = "^6.1.0"
 
 
