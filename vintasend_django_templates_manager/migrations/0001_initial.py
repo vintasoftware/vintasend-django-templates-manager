@@ -47,6 +47,10 @@ class Migration(migrations.Migration):
                     ),
                 ),
                 (
+                    "is_abstract",
+                    models.BooleanField(db_index=True, default=False, editable=False),
+                ),
+                (
                     "created_by",
                     models.ForeignKey(
                         blank=True,

@@ -3,12 +3,18 @@ from typing import TYPE_CHECKING
 from django.conf import settings
 from django.db import models
 
+from .composition import template_is_abstract
 from .contants import ManagedTemplateStatusChoices, ManagedTemplateTagStatusChoices
 from .managers import ManagedTemplateManager, ManagedTemplateTagManager
 
 
 if TYPE_CHECKING:
     from django_stubs_ext.db.models.manager import RelatedManager
+
+
+# The fields ``ManagedTemplate.is_abstract`` is derived from: change one and the flag has to
+# be recomputed, leave them alone and it cannot have changed.
+SOURCE_FIELDS = frozenset({"body_template", "subject_template", "preheader_template"})
 
 
 class ManagedTemplateTag(models.Model):
@@ -89,6 +95,15 @@ class ManagedTemplate(models.Model):
     )
     updated = models.DateTimeField(auto_now=True, db_index=True)
     tenant = models.CharField(max_length=255, null=True, blank=True, db_index=True)  # noqa: DJ001
+    # Whether this is a base to build on rather than a template to send -- it declares a
+    # ``{% managed_children %}`` hole, or blocks without extending anything.
+    #
+    # Derived, never typed in, which is what ``editable=False`` says: ``save()`` recomputes it
+    # from this row's own sources every time one of them changes. The column exists so a
+    # picker can exclude bases with a WHERE clause; answering the same question by parsing
+    # would mean reading every row in the store to draw one page. Indexed for that query, and
+    # for it alone.
+    is_abstract = models.BooleanField(default=False, editable=False, db_index=True)
     # Tags hang off a *version*, not off a key: two versions of one template can be labelled
     # differently, which is what lets a draft be tagged for review without relabelling the
     # version currently live.
@@ -117,6 +132,25 @@ class ManagedTemplate(models.Model):
         # The version is part of the label because it is part of the identity: without it two
         # versions of one template read identically everywhere Django renders a row by name.
         return f"{self.name} (v{self.version})"
+
+    def save(self, *args, **kwargs):
+        """Bring ``is_abstract`` back in step with the sources on the way to the database.
+
+        Here rather than in ``DjangoTemplateManager`` because the manager is not the only
+        thing that writes these rows: the admin, a data migration and a shell session all go
+        through ``save``, and a denormalized flag that only one write path maintains is a flag
+        that drifts. A malformed template reads as concrete rather than raising -- a save is
+        not the place to report a syntax error, and the admin form has already refused it.
+
+        A save narrowed with ``update_fields`` recomputes only when it touches a source, and
+        then carries ``is_abstract`` along so the new value is actually written.
+        """
+        update_fields = kwargs.get("update_fields")
+        if update_fields is None or not SOURCE_FIELDS.isdisjoint(update_fields):
+            self.is_abstract = template_is_abstract(self, strict=False)
+            if update_fields is not None:
+                kwargs["update_fields"] = [*update_fields, "is_abstract"]
+        super().save(*args, **kwargs)
 
 
 class ManagedTemplateStatusRecord(models.Model):

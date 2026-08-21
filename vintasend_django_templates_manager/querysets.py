@@ -49,6 +49,30 @@ class ManagedTemplateQuerySet(QuerySet["ManagedTemplate", "ManagedTemplate"]):
         """
         return self.filter(most_recent_active_version_q())
 
+    def abstract(self) -> "ManagedTemplateQuerySet":
+        """
+        Narrows to the bases: the templates other templates are built on.
+
+        Reads the denormalized ``is_abstract`` column, which ``ManagedTemplate.save`` keeps in
+        step with the sources -- which is what makes this a WHERE clause rather than a parse
+        of every row.
+
+        return: ManagedTemplateQuerySet
+        """
+        return self.filter(is_abstract=True)
+
+    def sendable(self) -> "ManagedTemplateQuerySet":
+        """
+        Narrows to the templates meant to be sent, leaving the bases out.
+
+        The list a "which template does this notification use" picker should be drawn from:
+        an abstract template renders perfectly well, it just renders a layout with a hole in
+        it where the content was supposed to go.
+
+        return: ManagedTemplateQuerySet
+        """
+        return self.filter(is_abstract=False)
+
 
 def normalize_tag_slugs(tags: object) -> list[str]:
     """Slugify a filter's tag values, so a filter may name a tag by the text behind it.

@@ -5,20 +5,25 @@ from django.contrib import admin
 from django.db import transaction
 from django.db.models import Count
 from django.http import HttpRequest
+from django.utils.html import format_html
 from django.utils.translation import gettext_lazy as _
 
+from vintasend_managed_templates.composition import TEMPLATE_FIELDS
 from vintasend_managed_templates.constants import ManagedTemplateStatus, ManagedTemplateTagStatus
+from vintasend_managed_templates.exceptions import ManagedTemplateCompositionError
 from vintasend_managed_templates.tags import next_available_slug, slugify_tag
 
+from .composition import backend_composer
 from .contants import ManagedTemplateStatusChoices, ManagedTemplateTagStatusChoices
 from .models import ManagedTemplate, ManagedTemplateStatusRecord, ManagedTemplateTag
 
 
 if TYPE_CHECKING:
     from django.contrib.auth.base_user import AbstractBaseUser
+    from django.contrib.auth.models import AnonymousUser
 
 
-def _acting_user(request: HttpRequest) -> "AbstractBaseUser | None":
+def _acting_user(request: HttpRequest) -> "AbstractBaseUser | AnonymousUser | None":
     """The logged-in admin user, or None when the request is unauthenticated."""
     user = request.user
     return user if user.is_authenticated else None
@@ -52,6 +57,14 @@ class ManagedTemplateAdminForm(forms.ModelForm):
     # decoupled from the enum. The admin still renders it as a select.
     status = forms.ChoiceField(choices=ManagedTemplateStatusChoices.choices, label=_("status"))
 
+    # Composition is resolved before the template engine ever sees a template, so a base that
+    # does not exist or a block left open is this app's error to report -- Django's engine
+    # will never complain about either, and the first sign of trouble would otherwise be a
+    # notification that failed to send. Checking here turns that into a form error, on the
+    # field that carries it. Set False on a subclass to save a template whose base has not
+    # been written yet.
+    validate_composition = True
+
     class Meta:
         model = ManagedTemplate
         # Listed explicitly rather than "__all__" so a new model field cannot silently become
@@ -71,6 +84,34 @@ class ManagedTemplateAdminForm(forms.ModelForm):
             "created_by",
         )
 
+    def clean(self) -> dict[str, Any]:
+        """Assemble each source the way rendering will, and report what does not.
+
+        The key and version of the row being edited are handed to the composer so a chain of
+        bases that leads back here is reported as the loop it is, rather than quietly
+        composing against the stored -- and by now stale -- copy of this very row.
+        """
+        cleaned_data: dict[str, Any] = super().clean() or {}
+        if not self.validate_composition:
+            return cleaned_data
+
+        composer = backend_composer()
+        # On a change form ``key`` and ``version`` are read-only, so they arrive on the
+        # instance rather than in the cleaned data.
+        key = cleaned_data.get("key") or self.instance.key or None
+        version = cleaned_data.get("version") or self.instance.version or None
+
+        for field in TEMPLATE_FIELDS:
+            source = cleaned_data.get(field)
+            if not source:
+                continue
+            try:
+                composer.compose_source(source, field=field, key=key, version=version)
+            except ManagedTemplateCompositionError as error:
+                self.add_error(field, str(error))
+
+        return cleaned_data
+
 
 @admin.register(ManagedTemplate)
 class ManagedTemplateAdmin(admin.ModelAdmin):
@@ -83,13 +124,21 @@ class ManagedTemplateAdmin(admin.ModelAdmin):
         "version",
         "template_managed_backend",
         "status",
+        "is_abstract",
         "tag_list",
         "tenant",
         "created_by",
         "updated",
     )
     list_display_links = ("name", "key")
-    list_filter = ("status", "template_managed_backend", "tags", "tenant", "created")
+    list_filter = (
+        "status",
+        "is_abstract",
+        "template_managed_backend",
+        "tags",
+        "tenant",
+        "created",
+    )
     list_select_related = ("created_by",)
     filter_horizontal = ("tags",)
     search_fields = ("key", "name", "description", "tags__text", "tags__slug")
@@ -100,7 +149,24 @@ class ManagedTemplateAdmin(admin.ModelAdmin):
 
     fieldsets = (
         (None, {"fields": ("name", "key", "version", "template_managed_backend", "description")}),
-        (_("Content"), {"fields": ("subject_template", "preheader_template", "body_template")}),
+        (
+            _("Content"),
+            {
+                "fields": (
+                    "subject_template",
+                    "preheader_template",
+                    "body_template",
+                    "composed_body",
+                ),
+                "description": _(
+                    'A template may build on another with {% managed_extends "key" %}, fill '
+                    "its {% managed_children %} hole, override its {% managed_block name %} "
+                    'regions, and splice in a fragment with {% managed_include "key" %}. All '
+                    "of it is resolved before the template engine runs, so the engine's own "
+                    "tags are left alone."
+                ),
+            },
+        ),
         (_("Lifecycle"), {"fields": ("status", "tags", "tenant")}),
         (_("Audit"), {"fields": ("created", "created_by", "updated")}),
     )
@@ -114,8 +180,32 @@ class ManagedTemplateAdmin(admin.ModelAdmin):
     def tag_list(self, obj: ManagedTemplate) -> str:
         return ", ".join(tag.text for tag in obj.tags.all())
 
+    @admin.display(description=_("composed body"))
+    def composed_body(self, obj: "ManagedTemplate | None" = None) -> str:
+        """The body as the template engine will receive it, every ``managed_*`` tag resolved.
+
+        The point of showing it is that the stored body is only half the template: what
+        actually goes out is this. It resolves against whatever the referenced templates are
+        *now*, so it is a preview of the next send rather than a record of the last one.
+        """
+        if obj is None or obj.pk is None:
+            return str(_("Save the template to see what it composes to."))
+
+        try:
+            composed = backend_composer().compose_source(
+                obj.body_template,
+                field="body_template",
+                key=obj.key,
+                version=obj.version,
+            )
+        except ManagedTemplateCompositionError as error:
+            return format_html('<ul class="errorlist"><li>{}</li></ul>', str(error))
+
+        return format_html('<pre style="white-space: pre-wrap">{}</pre>', composed)
+
     def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> tuple[str, ...]:
-        readonly: tuple[str, ...] = ("created", "updated")
+        # ``composed_body`` is a rendered preview, not a field: it is only ever read-only.
+        readonly: tuple[str, ...] = ("created", "updated", "composed_body")
         if obj is not None:
             # ``key`` + ``version`` are the template's identity: ``get_template`` and
             # ``get_latest_version`` look rows up by them, and ``update_template`` owns the

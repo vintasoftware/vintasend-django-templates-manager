@@ -82,8 +82,10 @@ _RANGE_FIELDS: dict[str, str] = {
 # Tag membership. Both take a collection of slugs rather than a lookup dict, so they are
 # translated by their own branch in ``_field_leaf`` instead of by one of the tables above.
 _TAG_FIELDS: frozenset[str] = frozenset({"includes_all_tags", "includes_any_of_tags"})
-# The one flag field: a bare boolean, and the only filter answered against the key's other
-# versions rather than against a column of the row. Its own branch in ``_field_leaf`` too.
+# The two boolean fields, each with its own branch in ``_field_leaf``. ``is_abstract`` is a
+# column the model derives from its own sources on save; ``most_recent_active_version`` is the
+# only filter answered against the key's *other* versions rather than against the row.
+_IS_ABSTRACT_FIELD = "is_abstract"
 _MOST_RECENT_ACTIVE_VERSION_FIELD = "most_recent_active_version"
 # order_by field name -> model field. ``created_at`` maps to ``created`` and ``updated_at`` to
 # ``modified``, matching the model's ``AutoCreatedField`` / ``AutoLastModifiedField``.
@@ -153,6 +155,10 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
             created=template.created,
             updated=template.updated,
             tags=[self._serialize_tag(tag) for tag in template.tags.all()],
+            # The stored flag rather than a fresh parse: the model derives it on every save,
+            # and reading the column is what keeps serializing a page of templates from
+            # parsing three sources per row.
+            is_abstract=template.is_abstract,
         )
 
     def _serialize_template_queryset(self, queryset: ManagedTemplateQuerySet):
@@ -588,6 +594,11 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         """Positive Q for one field filter, plus the model field to OR ``__isnull`` on when
         this leaf is negated. Returns the match-nothing Q (and no null field) for an unknown
         field, mirroring the reference evaluator's "unknown field never matches"."""
+        if field == _IS_ABSTRACT_FIELD:
+            # A plain column, unlike the flag below it: ``ManagedTemplate.save`` derives it
+            # from the row's own sources, so the query is a boolean lookup rather than
+            # anything computed here. Not nullable, so no null field to fold in on negation.
+            return Q(is_abstract=bool(value)), None
         if field == _MOST_RECENT_ACTIVE_VERSION_FIELD:
             # ``False`` is the complement, not "no filter": it asks for the rows the ``True``
             # filter leaves behind -- older versions, and every version of a key whose

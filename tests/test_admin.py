@@ -100,7 +100,11 @@ class TestStatusField:
 
 class TestIdentityFieldsAreLocked:
     def test_key_and_version_are_editable_on_add(self, template_admin, request_from):
-        assert set(template_admin.get_readonly_fields(request_from())) == {"created", "updated"}
+        assert set(template_admin.get_readonly_fields(request_from())) == {
+            "created",
+            "updated",
+            "composed_body",
+        }
         base_fields = template_admin.get_form(request_from()).base_fields
         assert "key" in base_fields
         assert "version" in base_fields
@@ -110,7 +114,7 @@ class TestIdentityFieldsAreLocked:
     ):
         template = make_template()
         readonly = set(template_admin.get_readonly_fields(request_from(), template))
-        assert readonly == {"created", "updated", "key", "version"}
+        assert readonly == {"created", "updated", "composed_body", "key", "version"}
         base_fields = template_admin.get_form(request_from(), template).base_fields
         assert "key" not in base_fields
         assert "version" not in base_fields
