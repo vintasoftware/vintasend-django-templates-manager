@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "vintasend-django-templates-manager"
-version = "2.0.0"
+version = "3.0.0"
 description = "A flexible package for implementing transactional notifications"
 authors = ["Hugo bessa <hugo@vinta.com.br>"]
 license = "MIT"
