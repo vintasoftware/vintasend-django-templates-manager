@@ -29,6 +29,7 @@ from vintasend_managed_templates.exceptions import (
     ManagedTemplateTagNotFoundError,
 )
 from vintasend_managed_templates.filters import (
+    MANAGED_TEMPLATE_ORDER_BY_FIELDS,
     ManagedTemplateFilter,
     ManagedTemplateOrderBy,
     is_choice_exact_filter_lookup,
@@ -39,6 +40,7 @@ from vintasend_managed_templates.filters import (
     is_string_filter_lookup,
     is_string_membership_exact_lookup,
     is_string_membership_in_lookup,
+    order_by_capability_key,
 )
 from vintasend_managed_templates.tags import next_available_slug, slugify_tag
 
@@ -87,9 +89,20 @@ _TAG_FIELDS: frozenset[str] = frozenset({"includes_all_tags", "includes_any_of_t
 # only filter answered against the key's *other* versions rather than against the row.
 _IS_ABSTRACT_FIELD = "is_abstract"
 _MOST_RECENT_ACTIVE_VERSION_FIELD = "most_recent_active_version"
-# order_by field name -> model field. ``created_at`` maps to ``created`` and ``updated_at`` to
-# ``modified``, matching the model's ``AutoCreatedField`` / ``AutoLastModifiedField``.
+# order_by field name -> model field. Every orderable field the vocabulary defines is a real
+# indexed column here, so each is answered by the database rather than in memory. ``created_at``
+# maps to ``created`` and ``updated_at`` to ``updated``, matching the model's ``auto_now_add`` /
+# ``auto_now`` fields; the other four are named the same on both sides.
+#
+# Each entry was established by running the sort, not by reading the column definition.
+# ``version`` is the one worth saying that about: it is a ``PositiveIntegerField``, so 10 sorts
+# after 2 -- a store keeping versions as strings would sort them 10, 2, 3 and look correct until
+# a key reached its tenth version.
 _ORDER_FIELD_TO_ATTR: dict[str, str] = {
+    "key": "key",
+    "name": "name",
+    "version": "version",
+    "status": "status",
     "created_at": "created",
     "updated_at": "updated",
 }
@@ -692,16 +705,59 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         filter: ManagedTemplateFilter,  # noqa: A002
         order_by: ManagedTemplateOrderBy | None = None,
     ) -> ManagedTemplateQuerySet:
-        queryset = ManagedTemplate.objects.filter(self._translate_filter(filter))
+        return self._ordered(
+            ManagedTemplate.objects.filter(self._translate_filter(filter)), order_by
+        )
+
+    @staticmethod
+    def _ordered(
+        queryset: ManagedTemplateQuerySet,
+        order_by: ManagedTemplateOrderBy | None,
+    ) -> ManagedTemplateQuerySet:
+        """Apply an order to the whole queryset, before any page is sliced off it.
+
+        Ordering the queryset rather than the page is the seam's requirement and not a detail:
+        a page ordered after it was chosen sorts rows *within* the page while the rows selected
+        *for* it came back in the store's own order -- right on page 1, wrong on every page
+        after it. Django composes ``order_by`` into the SQL, so the slice in
+        ``_paginate_queryset`` is taken from the ordered set.
+
+        Falls back to newest-first when no order was asked for, because an unordered offset
+        page over a table with a row per version is free to repeat one row and skip another.
+        """
         if order_by is None:
-            order_fields = ["-created", "-id"]
-        else:
-            attr = _ORDER_FIELD_TO_ATTR[order_by["field"]]
-            prefix = "-" if order_by["direction"] == "desc" else ""
-            # id tiebreaker in the SAME direction, so offset pagination over a non-unique key
-            # does not drop or duplicate rows across pages.
-            order_fields = [f"{prefix}{attr}", f"{prefix}id"]
-        return queryset.order_by(*order_fields)
+            return queryset.order_by("-created", "-id")
+
+        attr = _ORDER_FIELD_TO_ATTR[order_by["field"]]
+        prefix = "-" if order_by["direction"] == "desc" else ""
+        # id tiebreaker in the SAME direction, so offset pagination over a non-unique key
+        # does not drop or duplicate rows across pages.
+        return queryset.order_by(f"{prefix}{attr}", f"{prefix}id")
+
+    def get_filter_capabilities(self) -> dict[str, bool]:
+        """
+        Declare what this backend can be asked for.
+
+        Every filter the vocabulary defines is translated into SQL by ``_translate_filter``,
+        so nothing is declined there and the all-``True`` default in
+        ``DEFAULT_TEMPLATE_BACKEND_FILTER_CAPABILITIES`` is already correct for the filters.
+
+        Ordering is different: those keys default to ``False``, so a backend that can sort has
+        to say so. All six are declared because all six are indexed columns on
+        ``ManagedTemplate`` -- see ``_ORDER_FIELD_TO_ATTR``, whose entries were each checked by
+        running the sort rather than by reading the column definitions.
+
+        ``status`` is included even though it is stored as a ``CharField``: its four values are
+        lowercase ASCII, so a database collation orders them the same way the library's own
+        ``sort_templates`` does. A store that mapped two statuses onto one sortable value would
+        have to decline it -- a sort that cannot tell two of the four apart is worse than none.
+
+        return: dict[str, bool]
+        """
+        return {
+            order_by_capability_key(field): True
+            for field in MANAGED_TEMPLATE_ORDER_BY_FIELDS
+        }
 
     def get_filtered_templates(
         self,
@@ -716,13 +772,18 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         """
         return self._serialize_template_queryset(self._filtered_queryset(filters, order_by))
 
-    def get_paginated_templates(self, page: int, page_size: int):
-        # Ordered even though the seam asks for none: a key has a row per version, so an
-        # unordered offset page is free to return a row twice and skip another. The default
+    def get_paginated_templates(
+        self,
+        page: int,
+        page_size: int,
+        order_by: ManagedTemplateOrderBy | None = None,
+    ):
+        # Ordered even when the caller asks for none: a key has a row per version, so an
+        # unordered offset page is free to return a row twice and skip another. The fallback
         # matches ``_filtered_queryset``'s, id-tiebroken for rows that share a timestamp.
         return self._serialize_template_queryset(
             self._paginate_queryset(
-                ManagedTemplate.objects.order_by("-created", "-id"),
+                self._ordered(ManagedTemplate.objects.all(), order_by),
                 page=page,
                 page_size=page_size,
             )

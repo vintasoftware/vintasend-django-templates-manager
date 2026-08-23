@@ -69,6 +69,41 @@ Versions are the reason a published template can never change under a notificati
 referenced it: `update_template` inserts the next version and leaves its predecessor exactly as it
 was, content, status and history alike.
 
+## Filtering and ordering
+
+Every filter the library's vocabulary defines is translated into a Django `Q` and answered by the
+database, so this backend declines nothing. What `get_filter_capabilities` reports is the other
+direction — what it *can* do that the library does not assume:
+
+```python
+service.get_backend_supported_filter_capabilities()
+# {..., 'orderBy.key': True, 'orderBy.name': True, 'orderBy.version': True,
+#       'orderBy.status': True, 'orderBy.createdAt': True, 'orderBy.updatedAt': True}
+```
+
+The six `orderBy.*` keys are declared explicitly because they default to `False` in the library:
+ordering is newer vocabulary than the filters, so a backend that can sort has to say so rather
+than be assumed to. All six are real indexed columns on `ManagedTemplate`, so each is answered by
+the database:
+
+```python
+service.get_paginated_templates(
+    page=1, page_size=20, order_by={"field": "version", "direction": "desc"}
+)
+```
+
+Two details worth knowing:
+
+* **The order is composed into the SQL, not applied to the page.** A page ordered after it was
+  chosen sorts rows *within* the page while the rows selected *for* it came back in the store's
+  own order — right on page 1, wrong on every page after it.
+* **`version` is a `PositiveIntegerField`**, so v10 sorts after v2. A store keeping versions as
+  strings gets that wrong silently, which is why every orderable field is pinned by a test that
+  runs the sort rather than reads the column definition.
+
+An unordered read still orders by `-created, -id`: a key has a row per version, so an unordered
+offset page is free to return one row twice and skip another.
+
 ## The admin
 
 All three models are registered.
