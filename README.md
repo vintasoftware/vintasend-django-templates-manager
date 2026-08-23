@@ -159,9 +159,9 @@ also the thing a "pick a template" screen most needs to filter on, so it is deno
 column:
 
 ```python
-ManagedTemplate.objects.sendable()      # what a picker should offer
-ManagedTemplate.objects.abstract()      # the bases
-service.get_filtered_templates({"is_abstract": False})   # the same, through the library
+ManagedTemplate.objects.sendable()  # what a picker should offer
+ManagedTemplate.objects.abstract()  # the bases
+service.get_filtered_templates({"is_abstract": False})  # the same, through the library
 ```
 
 `ManagedTemplate.save()` derives it, so every write path keeps it honest — the admin,
@@ -175,8 +175,8 @@ column existed:
 ```python
 from vintasend_django_templates_manager.composition import template_is_abstract
 
-template_is_abstract(template)                 # raises on a malformed tag
-template_is_abstract(template, strict=False)   # reads an unparseable template as concrete
+template_is_abstract(template)  # raises on a malformed tag
+template_is_abstract(template, strict=False)  # reads an unparseable template as concrete
 ```
 
 Composition resolves references through this backend, which means an unpinned `{% managed_extends

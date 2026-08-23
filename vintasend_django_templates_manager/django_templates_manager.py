@@ -754,10 +754,7 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
 
         return: dict[str, bool]
         """
-        return {
-            order_by_capability_key(field): True
-            for field in MANAGED_TEMPLATE_ORDER_BY_FIELDS
-        }
+        return {order_by_capability_key(field): True for field in MANAGED_TEMPLATE_ORDER_BY_FIELDS}
 
     def get_filtered_templates(
         self,

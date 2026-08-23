@@ -90,9 +90,7 @@ def test_version_orders_numerically(manager, make_template):
     for version in (10, 2, 3, 1, 11):
         make_template(key="welcome", version=version)
 
-    ordered = manager.get_filtered_templates(
-        {}, order_by={"field": "version", "direction": "asc"}
-    )
+    ordered = manager.get_filtered_templates({}, order_by={"field": "version", "direction": "asc"})
 
     assert [t.version for t in ordered] == [1, 2, 3, 10, 11]
 
@@ -136,9 +134,7 @@ def test_an_unordered_paginated_read_is_still_deterministic(manager, rows):
     """An unordered offset page over a table with a row per version repeats and skips rows."""
     everything = [t.key for t in manager.get_paginated_templates(page=1, page_size=10)]
     paged = [
-        t.key
-        for page in (1, 2)
-        for t in manager.get_paginated_templates(page=page, page_size=2)
+        t.key for page in (1, 2) for t in manager.get_paginated_templates(page=page, page_size=2)
     ]
 
     assert paged == everything
