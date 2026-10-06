@@ -279,24 +279,27 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
 
     def delete_template(self, template_key: str, version: int | None = None) -> None:
         template: ManagedTemplate | None
-        if version is not None:
-            try:
-                template = ManagedTemplate.objects.select_for_update().get(
-                    key=template_key, version=version
+        with transaction.atomic():
+            if version is not None:
+                try:
+                    template = ManagedTemplate.objects.select_for_update().get(
+                        key=template_key, version=version
+                    )
+                except ManagedTemplate.DoesNotExist as e:
+                    raise ManagedTemplateNotFoundError(
+                        f"Template with key '{template_key}' and version {version} does not exist."
+                    ) from e
+            else:
+                template = ManagedTemplate.objects.select_for_update().get_latest_version(
+                    template_key
                 )
-            except ManagedTemplate.DoesNotExist as e:
+
+            if not template:
                 raise ManagedTemplateNotFoundError(
-                    f"Template with key '{template_key}' and version {version} does not exist."
-                ) from e
-        else:
-            template = ManagedTemplate.objects.select_for_update().get_latest_version(template_key)
+                    f"Template with key '{template_key}' does not exist."
+                )
 
-        if not template:
-            raise ManagedTemplateNotFoundError(
-                f"Template with key '{template_key}' does not exist."
-            )
-
-        template.delete()
+            template.delete()
 
     def create_template_status_update(
         self,
@@ -319,16 +322,16 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
                     f"`changed_by` user with id {changed_by} couldn't be found"
                 )
 
-        try:
-            template = ManagedTemplate.objects.select_for_update().get(
-                key=template_key, version=version
-            )
-        except ManagedTemplate.DoesNotExist as e:
-            raise ManagedTemplateNotFoundError(
-                f"Template with key '{template_key}' and version '{version}' does not exist."
-            ) from e
-
         with transaction.atomic():
+            try:
+                template = ManagedTemplate.objects.select_for_update().get(
+                    key=template_key, version=version
+                )
+            except ManagedTemplate.DoesNotExist as e:
+                raise ManagedTemplateNotFoundError(
+                    f"Template with key '{template_key}' and version '{version}' does not exist."
+                ) from e
+
             ManagedTemplateStatusRecord.objects.create(
                 template=template,
                 status=status.value,
