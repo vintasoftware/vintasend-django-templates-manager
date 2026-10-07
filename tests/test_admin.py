@@ -288,6 +288,107 @@ class TestAdminPagesRender:
         )
         assert admin_client.get(url).status_code == 200
 
+    def test_the_audit_changelist_lists_history_whose_version_was_deleted(
+        self, admin_client, make_template
+    ):
+        template = make_template(key="gone-template", version=3)
+        ManagedTemplateStatusRecord.objects.create(
+            template=template, status=ManagedTemplateStatus.ACTIVE.value
+        )
+        template.delete()
+        url = reverse(
+            "admin:vintasend_django_templates_manager_managedtemplatestatusrecord_changelist"
+        )
+
+        response = admin_client.get(url, {"q": "gone-template"})
+
+        assert response.status_code == 200
+        assert b"gone-template" in response.content
+
+    def test_the_delete_page_refuses_a_published_version(self, admin_client, make_template):
+        template = make_template(status=ManagedTemplateStatus.ACTIVE.value)
+        url = reverse(
+            "admin:vintasend_django_templates_manager_managedtemplate_delete", args=[template.pk]
+        )
+
+        assert admin_client.get(url).status_code == 403
+        assert admin_client.post(url, {"post": "yes"}).status_code == 403
+        assert ManagedTemplate.objects.filter(pk=template.pk).exists()
+
+    def test_the_delete_page_refuses_a_draft_that_was_published_before(
+        self, admin_client, make_template
+    ):
+        template = make_template(status=ManagedTemplateStatus.DRAFT.value)
+        ManagedTemplateStatusRecord.objects.create(
+            template=template, status=ManagedTemplateStatus.ACTIVE.value
+        )
+        url = reverse(
+            "admin:vintasend_django_templates_manager_managedtemplate_delete", args=[template.pk]
+        )
+
+        assert admin_client.post(url, {"post": "yes"}).status_code == 403
+
+    def test_the_delete_page_deletes_a_never_published_draft(self, admin_client, make_template):
+        template = make_template()
+        url = reverse(
+            "admin:vintasend_django_templates_manager_managedtemplate_delete", args=[template.pk]
+        )
+
+        assert admin_client.post(url, {"post": "yes"}).status_code == 302
+        assert not ManagedTemplate.objects.filter(pk=template.pk).exists()
+
+    def test_bulk_delete_refuses_a_batch_holding_a_published_version(
+        self, admin_client, make_template
+    ):
+        draft = make_template(key="draft-one")
+        published = make_template(key="live-one", status=ManagedTemplateStatus.ACTIVE.value)
+        url = reverse("admin:vintasend_django_templates_manager_managedtemplate_changelist")
+
+        response = admin_client.post(
+            url,
+            {
+                "action": "delete_selected",
+                "_selected_action": [draft.pk, published.pk],
+                "post": "yes",
+            },
+        )
+
+        assert response.status_code == 403
+        assert ManagedTemplate.objects.count() == 2
+
+    def test_bulk_delete_removes_never_published_drafts(self, admin_client, make_template):
+        drafts = [make_template(key="one"), make_template(key="two")]
+        url = reverse("admin:vintasend_django_templates_manager_managedtemplate_changelist")
+
+        response = admin_client.post(
+            url,
+            {
+                "action": "delete_selected",
+                "_selected_action": [d.pk for d in drafts],
+                "post": "yes",
+            },
+        )
+
+        assert response.status_code == 302
+        assert ManagedTemplate.objects.count() == 0
+
+    def test_a_subclass_can_allow_deleting_published_versions(
+        self, template_admin, request_from, make_template, admin_user
+    ):
+        from vintasend_django_templates_manager.admin import ManagedTemplateAdmin
+
+        class Permissive(ManagedTemplateAdmin):
+            allow_deleting_published_versions = True
+
+        template = make_template(status=ManagedTemplateStatus.ACTIVE.value)
+        permissive = Permissive(ManagedTemplate, site)
+        request = request_from()
+        request.user = admin_user
+
+        assert permissive.has_delete_permission(request, template) is True
+        permissive.delete_queryset(request, ManagedTemplate.objects.filter(pk=template.pk))
+        assert not ManagedTemplate.objects.exists()
+
     def test_adding_through_the_admin_creates_the_template_and_its_history(self, admin_client, db):
         url = reverse("admin:vintasend_django_templates_manager_managedtemplate_add")
         response = admin_client.post(

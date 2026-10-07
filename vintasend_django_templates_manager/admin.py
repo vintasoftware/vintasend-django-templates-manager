@@ -2,8 +2,9 @@ from typing import TYPE_CHECKING, Any
 
 from django import forms
 from django.contrib import admin
+from django.core.exceptions import PermissionDenied
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, QuerySet
 from django.http import HttpRequest
 from django.utils.html import format_html
 from django.utils.translation import gettext_lazy as _
@@ -118,6 +119,10 @@ class ManagedTemplateAdmin(admin.ModelAdmin):
     form = ManagedTemplateAdminForm
     inlines = (ManagedTemplateStatusRecordInline,)
 
+    # Off by default, like ``DjangoTemplateManager``'s option of the same name: only a version
+    # that was never published can be deleted here. Set True on a subclass to allow it.
+    allow_deleting_published_versions = False
+
     list_display = (
         "name",
         "key",
@@ -213,6 +218,52 @@ class ManagedTemplateAdmin(admin.ModelAdmin):
             readonly += ("key", "version")
         return readonly
 
+    @staticmethod
+    def _includes_published(queryset: "QuerySet[ManagedTemplate]") -> bool:
+        """Whether any version in ``queryset`` was ever published -- the deletion rule.
+
+        Published means not in DRAFT now, or anything but DRAFT in its status history; see
+        ``vintasend_managed_templates.lifecycle.is_template_version_deletable``.
+        """
+        return (
+            queryset.exclude(status=ManagedTemplateStatus.DRAFT.value).exists()
+            or ManagedTemplateStatusRecord.objects.filter(template__in=queryset)
+            .exclude(status=ManagedTemplateStatus.DRAFT.value)
+            .exists()
+        )
+
+    def has_delete_permission(self, request: HttpRequest, obj: Any = None) -> bool:
+        """Hide the delete button, and refuse the delete page, for a published version."""
+        if not super().has_delete_permission(request, obj):
+            return False
+        if obj is None or self.allow_deleting_published_versions:
+            return True
+        return not self._includes_published(ManagedTemplate.objects.filter(pk=obj.pk))
+
+    def delete_model(self, request: HttpRequest, obj: ManagedTemplate) -> None:
+        self._refuse_published(ManagedTemplate.objects.filter(pk=obj.pk))
+        super().delete_model(request, obj)
+
+    def delete_queryset(self, request: HttpRequest, queryset: "QuerySet[ManagedTemplate]") -> None:
+        """Refuse the whole "Delete selected" batch if any version in it was published.
+
+        The whole batch rather than the published rows only: the action reports "deleted N"
+        from the count it showed for confirmation, so a partial delete would misreport.
+        """
+        self._refuse_published(queryset)
+        # Re-selected by primary key: the changelist queryset is ``distinct()`` (see
+        # ``get_queryset``), and Django before 5.0 refuses to ``delete()`` one.
+        super().delete_queryset(
+            request,
+            ManagedTemplate.objects.filter(pk__in=list(queryset.values_list("pk", flat=True))),
+        )
+
+    def _refuse_published(self, queryset: "QuerySet[ManagedTemplate]") -> None:
+        if not self.allow_deleting_published_versions and self._includes_published(queryset):
+            raise PermissionDenied(
+                "A published template version cannot be deleted; archive it instead."
+            )
+
     def get_changeform_initial_data(self, request: HttpRequest) -> dict[str, str | list[str]]:
         initial = super().get_changeform_initial_data(request)
         initial.setdefault("version", "1")
@@ -242,17 +293,29 @@ class ManagedTemplateAdmin(admin.ModelAdmin):
 
 @admin.register(ManagedTemplateStatusRecord)
 class ManagedTemplateStatusRecordAdmin(admin.ModelAdmin):
-    """Browsable, non-editable view over the status audit trail."""
+    """Browsable, non-editable view over the status audit trail.
 
-    list_display = ("template", "status", "created", "created_by", "tenant")
+    Records outlive the versions they describe, so a row's own ``template_key`` and ``version``
+    are what it is listed and searched by: ``template`` is empty once its version is deleted.
+    """
+
+    list_display = ("template_key", "version", "status", "created", "created_by", "tenant")
     list_filter = ("status", "created", "tenant")
-    list_select_related = ("template", "created_by")
-    search_fields = ("template__key", "template__name")
+    list_select_related = ("created_by",)
+    search_fields = ("template_key", "template__name")
     search_help_text = _("Search by template key or name.")
     ordering = ("-created",)
     date_hierarchy = "created"
     raw_id_fields = ("template", "created_by")
-    readonly_fields = ("template", "status", "created", "created_by", "tenant")
+    readonly_fields = (
+        "template_key",
+        "version",
+        "template",
+        "status",
+        "created",
+        "created_by",
+        "tenant",
+    )
 
     def has_add_permission(self, request: HttpRequest) -> bool:
         return False

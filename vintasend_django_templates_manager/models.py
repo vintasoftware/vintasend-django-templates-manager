@@ -154,7 +154,26 @@ class ManagedTemplate(models.Model):
 
 
 class ManagedTemplateStatusRecord(models.Model):
-    template = models.ForeignKey(ManagedTemplate, on_delete=models.CASCADE, related_name="history")
+    """One status change of one template version: the audit trail of who published what.
+
+    A record outlives the version it describes. ``template`` is nulled rather than cascaded
+    when its version is deleted, and ``template_key`` / ``version`` are copied onto the row
+    when it is saved, so a record still says which version it was about -- and
+    ``DjangoTemplateManager.get_template_status_history`` still returns it -- after that
+    version is gone.
+    """
+
+    template = models.ForeignKey(
+        ManagedTemplate,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="history",
+    )
+    # Copied from ``template`` on save. They are the record's identity once ``template`` has
+    # been nulled, and what history is read by.
+    template_key = models.CharField(max_length=255)
+    version = models.PositiveIntegerField()
     status = models.CharField(max_length=50, choices=ManagedTemplateStatusChoices.choices)
     created = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey(
@@ -166,5 +185,27 @@ class ManagedTemplateStatusRecord(models.Model):
     )
     tenant = models.CharField(max_length=255, null=True, blank=True)  # noqa: DJ001
 
+    class Meta:
+        indexes = [  # noqa: RUF012 - Django Meta options are not ClassVar-annotated
+            models.Index(
+                fields=("template_key", "version"),
+                name="vintasend_mt_history_key_ver",
+            ),
+        ]
+
     def __str__(self):
-        return f"{self.template.key} v{self.template.version}: {self.status}"
+        return f"{self.template_key} v{self.version}: {self.status}"
+
+    def save(self, *args, **kwargs):
+        """Copy the version's key and number onto the record before writing it.
+
+        Here rather than in ``DjangoTemplateManager`` because the manager is not the only
+        thing that writes these rows: the admin writes them too, and a record missing its key
+        would be unreadable once its version is deleted. A version's key and number never
+        change after it is created, so copying them on every save cannot overwrite anything.
+        """
+        template = self.template
+        if template is not None:
+            self.template_key = template.key
+            self.version = template.version
+        super().save(*args, **kwargs)
