@@ -17,7 +17,10 @@ from django.db import connection
 
 import pytest
 from vintasend_managed_templates.constants import ManagedTemplateStatus
-from vintasend_managed_templates.dataclasses import ManagedTemplateUpdateInput
+from vintasend_managed_templates.dataclasses import (
+    ManagedTemplateCreateInput,
+    ManagedTemplateUpdateInput,
+)
 
 from vintasend_django_templates_manager.models import ManagedTemplate, ManagedTemplateStatusRecord
 
@@ -84,3 +87,27 @@ def test_tag_rename_locks_inside_a_transaction(manager, make_tag):
     renamed = manager.update_tag("blak-friday", "Black Friday")
 
     assert renamed.slug == "black-friday"
+
+
+def test_recreating_a_key_whose_versions_were_deleted_locks_inside_a_transaction(
+    manager, make_template
+):
+    """The key's surviving history is what two concurrent recreates share, so it is locked."""
+    make_template(key="welcome", version=1)
+    manager.create_template_status_update("welcome", 1, ManagedTemplateStatus.DRAFT)
+    manager.delete_template("welcome", 1)
+
+    recreated = manager.create_template(
+        ManagedTemplateCreateInput(
+            name="Welcome",
+            description="",
+            key="welcome",
+            template_managed_backend="django",
+            template_body="Hi",
+            template_subject=None,
+            template_preheader=None,
+            tenant=None,
+        )
+    )
+
+    assert recreated.version == 2

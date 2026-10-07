@@ -4,7 +4,7 @@ from enum import Enum
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AbstractUser
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Max, Q
 
 from vintasend_managed_templates.base_template_manager_backend import BaseTemplateManagerBackend
@@ -215,6 +215,32 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         ]
         return max((number for number in highest if number is not None), default=0) + 1
 
+    def _first_version(self, template_key: str) -> int:
+        """The number a new key's first version takes. Call it inside the creating transaction.
+
+        A key that still has any version is refused with ``IntegrityError``, the error a
+        duplicate ``(key, version)`` has always raised. Checking for any version, not just v1,
+        matters once v1 can be deleted: handing v1 out again would give it the deleted v1's
+        history.
+
+        A key whose versions were all deleted starts above the numbers its history used. That
+        history is the only thing two concurrent creates of such a key share, so it is locked
+        first: the second create waits, then sees the first one's version and is refused, rather
+        than both claiming the same number. A key with neither versions nor history has nothing
+        to lock; both creates pick 1 and the ``(key, version)`` constraint refuses one.
+        """
+        list(
+            ManagedTemplateStatusRecord.objects.select_for_update()
+            .filter(template_key=template_key)
+            .values_list("pk", flat=True)
+        )
+        if ManagedTemplate.objects.filter(key=template_key).exists():
+            raise IntegrityError(
+                f"Template with key '{template_key}' already exists; "
+                "add a version with update_template instead."
+            )
+        return self._next_version(template_key)
+
     def _paginate_queryset(
         self, queryset: ManagedTemplateQuerySet, page: int, page_size: int
     ) -> ManagedTemplateQuerySet:
@@ -224,14 +250,8 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         # M2M writes need the row to exist, so tagging is a second statement -- inside the
         # same transaction as the insert, so an unusable tag rolls the template back rather
         # than leaving one behind that the caller was told had failed.
-        # A key that still has versions is refused by the (key, version) constraint, as it always
-        # was. A key whose versions were all deleted starts above the numbers its history used.
-        version = (
-            1
-            if ManagedTemplate.objects.filter(key=data.key).exists()
-            else self._next_version(data.key)
-        )
         with transaction.atomic():
+            version = self._first_version(data.key)
             template = ManagedTemplate.objects.create(
                 name=data.name,
                 description=data.description,
