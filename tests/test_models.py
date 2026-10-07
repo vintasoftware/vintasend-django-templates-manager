@@ -60,13 +60,17 @@ def test_history_is_the_reverse_accessor_for_status_records(make_template):
     assert list(template.history.all()) == [record]
 
 
-def test_deleting_a_template_cascades_to_its_history(make_template):
-    template = make_template()
-    ManagedTemplateStatusRecord.objects.create(
+def test_deleting_a_template_keeps_its_history(make_template):
+    template = make_template(key="welcome", version=2)
+    record = ManagedTemplateStatusRecord.objects.create(
         template=template, status=ManagedTemplateStatus.ACTIVE.value
     )
+
     template.delete()
-    assert ManagedTemplateStatusRecord.objects.count() == 0
+
+    record.refresh_from_db()
+    assert record.template is None
+    assert (record.template_key, record.version, record.status) == ("welcome", 2, "active")
 
 
 def test_versions_of_one_key_coexist_as_separate_rows(make_template):

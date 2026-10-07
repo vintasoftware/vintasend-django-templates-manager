@@ -5,7 +5,7 @@ from enum import Enum
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AbstractUser
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Max, Q
 
 from vintasend_managed_templates.base_template_manager_backend import BaseTemplateManagerBackend
 from vintasend_managed_templates.constants import ManagedTemplateStatus, ManagedTemplateTagStatus
@@ -41,6 +41,10 @@ from vintasend_managed_templates.filters import (
     is_string_membership_exact_lookup,
     is_string_membership_in_lookup,
     order_by_capability_key,
+)
+from vintasend_managed_templates.lifecycle import (
+    assert_template_version_deletable,
+    no_active_version,
 )
 from vintasend_managed_templates.tags import next_available_slug, slugify_tag
 
@@ -139,7 +143,20 @@ def _or_all(queries: list[Q]) -> Q:
 
 
 class DjangoTemplateManager(BaseTemplateManagerBackend):
+    """The template-manager seam over the Django ORM.
+
+    :param allow_deleting_published_versions: when True, ``delete_template`` removes a version
+        whatever its status. Off by default: only a version that was never published can be
+        deleted (see ``vintasend_managed_templates.lifecycle.is_template_version_deletable``).
+        ``ManagedTemplateService`` checks the rule too, under its own option of the same name,
+        so a hard delete of a published version through the service needs both switched on.
+        Its status history is kept either way.
+    """
+
     template_backend_name = "django"
+
+    def __init__(self, allow_deleting_published_versions: bool = False) -> None:
+        self.allow_deleting_published_versions = allow_deleting_published_versions
 
     def _serialize_tag(self, tag: ManagedTemplateTag):
         return ManagedTemplateTagDataclass(
@@ -181,6 +198,23 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         for template in queryset.prefetch_related("tags"):
             yield self._serialize_template(template)
 
+    def _next_version(self, template_key: str) -> int:
+        """One above the highest version number the key has ever had, history included.
+
+        A version number is never reused. Status history outlives a deleted version and is read
+        by key and version, so a new version that took a deleted one's number would inherit its
+        history -- a publish that never happened, and a draft the deletion rule then refuses.
+        """
+        highest = [
+            ManagedTemplate.objects.filter(key=template_key).aggregate(Max("version"))[
+                "version__max"
+            ],
+            ManagedTemplateStatusRecord.objects.filter(template_key=template_key).aggregate(
+                Max("version")
+            )["version__max"],
+        ]
+        return max((number for number in highest if number is not None), default=0) + 1
+
     def _paginate_queryset(
         self, queryset: ManagedTemplateQuerySet, page: int, page_size: int
     ) -> ManagedTemplateQuerySet:
@@ -190,6 +224,13 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         # M2M writes need the row to exist, so tagging is a second statement -- inside the
         # same transaction as the insert, so an unusable tag rolls the template back rather
         # than leaving one behind that the caller was told had failed.
+        # A key that still has versions is refused by the (key, version) constraint, as it always
+        # was. A key whose versions were all deleted starts above the numbers its history used.
+        version = (
+            1
+            if ManagedTemplate.objects.filter(key=data.key).exists()
+            else self._next_version(data.key)
+        )
         with transaction.atomic():
             template = ManagedTemplate.objects.create(
                 name=data.name,
@@ -200,7 +241,7 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
                 subject_template=data.template_subject,
                 preheader_template=data.template_preheader,
                 tenant=data.tenant,
-                version=1,
+                version=version,
                 status=ManagedTemplateStatus.DRAFT.value,
             )
             if data.tags:
@@ -225,6 +266,27 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
             )
 
         return self._serialize_template(template)
+
+    def get_active_template(self, template_key: str):
+        """The version an unpinned send renders: the highest-numbered ACTIVE one.
+
+        One indexed query rather than the seam's filter-based default. ``version`` is an integer
+        column, so v10 sorts above v2.
+        """
+        template = (
+            ManagedTemplate.objects.filter(
+                key=template_key, status=ManagedTemplateStatus.ACTIVE.value
+            )
+            .order_by("-version")
+            .first()
+        )
+        if template is not None:
+            return self._serialize_template(template)
+        if not ManagedTemplate.objects.filter(key=template_key).exists():
+            raise ManagedTemplateNotFoundError(
+                f"Template with key '{template_key}' does not exist."
+            )
+        raise no_active_version(template_key)
 
     def update_template(self, template_key: str, data: ManagedTemplateUpdateInput):
         """Insert the next version of a key, leaving the version it was copied from alone.
@@ -267,7 +329,8 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
                 body_template=data.template_body or previous.body_template,
                 subject_template=data.template_subject or previous.subject_template,
                 preheader_template=data.template_preheader or previous.preheader_template,
-                version=previous.version + 1,
+                # Not ``previous.version + 1``: a deleted version above it keeps its number.
+                version=self._next_version(template_key),
                 status=ManagedTemplateStatus.DRAFT.value,
                 tenant=previous.tenant,
                 # Left unattributed on purpose: ``ManagedTemplateUpdateInput`` carries no
@@ -278,8 +341,16 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         return self._serialize_template(template)
 
     def delete_template(self, template_key: str, version: int | None = None) -> None:
-        template: ManagedTemplate | None
+        """Delete one never-published version, or the latest one when ``version`` is None.
+
+        A version that was ever published raises ``ManagedTemplateDeletionNotAllowedError``
+        unless ``allow_deleting_published_versions`` is on. The row is locked while the rule is
+        checked, so a status change cannot land between the check and the delete. Its status
+        history is never deleted: the records keep their own key and version, and their link
+        to the deleted row is nulled.
+        """
         with transaction.atomic():
+            template: ManagedTemplate | None
             if version is not None:
                 try:
                     template = ManagedTemplate.objects.select_for_update().get(
@@ -299,6 +370,11 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
                     f"Template with key '{template_key}' does not exist."
                 )
 
+            if not self.allow_deleting_published_versions:
+                assert_template_version_deletable(
+                    self._serialize_template(template),
+                    self._status_history(template.key, template.version),
+                )
             template.delete()
 
     def create_template_status_update(
@@ -346,11 +422,18 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
         Omitting ``version`` reads the *key's* whole trail rather than its latest version's:
         each version carries its own records, so anything narrower would quietly drop the
         history of the versions still serving older notifications.
+
+        Records are read by the key and version stored on them, so the trail of a deleted
+        version is still returned. Not found is raised only when there is neither a version
+        nor a record to answer with.
         """
+        history = self._status_history(template_key, version)
+        if history:
+            return history
+
         versions = ManagedTemplate.objects.filter(key=template_key)
         if version is not None:
             versions = versions.filter(version=version)
-
         if not versions.exists():
             if version is not None:
                 raise ManagedTemplateNotFoundError(
@@ -359,18 +442,24 @@ class DjangoTemplateManager(BaseTemplateManagerBackend):
             raise ManagedTemplateNotFoundError(
                 f"Template with key '{template_key}' does not exist."
             )
+        return history
 
+    def _status_history(
+        self, template_key: str, version: int | None
+    ) -> list[ManagedTemplateStatusHistory]:
+        records = ManagedTemplateStatusRecord.objects.filter(template_key=template_key)
+        if version is not None:
+            records = records.filter(version=version)
         records = (
-            ManagedTemplateStatusRecord.objects.filter(template__in=versions)
-            .select_related("template", "created_by")
+            records.select_related("created_by")
             # ``-id`` breaks a tie between records written in the same transaction, which
             # share a timestamp to the microsecond often enough to matter under a frozen clock.
             .order_by("-created", "-id")
         )
         return [
             ManagedTemplateStatusHistory(
-                template_key=record.template.key,
-                version=record.template.version,
+                template_key=record.template_key,
+                version=record.version,
                 status=ManagedTemplateStatus(record.status),
                 created=record.created,
                 created_by=str(record.created_by.pk) if record.created_by else None,

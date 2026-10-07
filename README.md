@@ -57,12 +57,48 @@ template name, so a renderer that resolves names through a loader —
 Everything else — creating templates, publishing versions, tagging, filtering — is
 `ManagedTemplateService`'s API, unchanged.
 
+## Which version a send renders
+
+`get_active_template` is implemented natively: one indexed query for the key's highest-numbered
+`active` version. That is what an unpinned send renders and what `pin_template_versions` pins to,
+so a draft is never sent. A key that exists but has no active version raises
+`ManagedTemplateNoActiveVersionError`. `get_template(key)` with no version still answers the newest
+version whatever its status, for editors and APIs. See
+[Which version a send renders](https://github.com/vintasoftware/vintasend-managed-templates#which-version-a-send-renders).
+
+## Deleting a version
+
+`delete_template` deletes only a version that was **never published**: still `draft`, with nothing
+but `draft` in its status history. Anything else raises `ManagedTemplateDeletionNotAllowedError`,
+including `delete_template(key)` with no version when the latest version is published. Archive a
+published version instead.
+
+The rule is checked with the row locked, inside the same transaction as the delete. To allow hard
+deletes of published versions, which an operator should rarely need, switch it off on both the
+backend and the service:
+
+```python
+manager_backend = DjangoTemplateManager(allow_deleting_published_versions=True)
+service = ManagedTemplateService(manager_backend, renderer, allow_deleting_published_versions=True)
+```
+
+**Status history is never deleted**, whichever way a version goes: through `delete_template`, the
+admin, or `ManagedTemplate.objects...delete()`. Each record stores its own `template_key` and
+`version`, and its `template` link is set to `NULL` when the version is deleted, so
+`get_template_status_history` keeps returning it. For the same reason a deleted version's number
+is never reused: the next version is numbered one above the highest the key has ever had,
+history included, so it cannot inherit someone else's trail.
+
+The admin applies the same rule. A published version has no delete button and its delete page
+answers 403, and a "Delete selected" batch holding one is refused whole. Set
+`allow_deleting_published_versions = True` on a `ManagedTemplateAdmin` subclass to lift it.
+
 ## What is stored
 
 | Model | What it holds |
 |---|---|
 | `ManagedTemplate` | One **version** of a template. `(key, version)` is unique, and a key has as many rows as it has versions. Nothing about a row changes once it exists except its status, its tags, and the derived `is_abstract` flag. |
-| `ManagedTemplateStatusRecord` | The audit trail: who moved a version to which status, and when. |
+| `ManagedTemplateStatusRecord` | The audit trail: who moved a version to which status, and when. Each record keeps its version's `template_key` and `version` on its own row, so it outlives the version (`template` becomes `NULL`). |
 | `ManagedTemplateTag` | A label shared across templates, identified by the slug `vintasend_managed_templates.tags.slugify_tag` derives from its text. |
 
 Versions are the reason a published template can never change under a notification that already
@@ -110,10 +146,43 @@ All three models are registered.
 
 * **Templates** — `key` and `version` lock once the row exists, since they are its identity. Every
   status change made here is written to the audit trail, which is inlined read-only on the page.
+  Only a never-published version can be deleted here — see [Deleting a version](#deleting-a-version).
 * **Tags** — the slug is derived from the text on save rather than typed in, and collides safely
   (`black-friday-2`). Archive and restore are bulk actions; archiving retires a tag from the
   pickers without severing it from the templates carrying it.
-* **Status history** — browsable, never editable.
+* **Status history** — browsable, never editable. Listed and searched by each record's own key
+  and version, so the history of a deleted version still shows up.
+
+## Upgrading: the status-history migrations
+
+`0002`–`0004` move status history off `on_delete=CASCADE`:
+
+* `0002` adds nullable `template_key` and `version` columns to `ManagedTemplateStatusRecord`.
+* `0003` is the data step. It copies each record's key and version from the version it belongs to,
+  with one `UPDATE` per column. It only touches records that are still missing them, so running it
+  again changes nothing.
+* `0004` makes both columns required, makes `template` nullable with `on_delete=SET_NULL`, and adds
+  an index on `(template_key, version)`.
+
+They are split so the data copy never shares a transaction with a schema change on the same
+table, which PostgreSQL can refuse.
+
+**Deploy order.** Code from before this release writes status records without `template_key` or
+`version`, which `0004` makes required, and this release's code needs the columns `0002` adds.
+Migrating and switching code in one step (stop, migrate, start) needs nothing more. For a rolling
+deploy, where old and new instances serve side by side:
+
+1. `python manage.py migrate vintasend_django_templates_manager 0002`
+2. roll out the new code everywhere, and wait until no old instance is left;
+3. `python manage.py migrate` — `0003` fills any record an old instance wrote meanwhile, and
+   `0004` makes the columns required.
+
+**Rolling back** with `python manage.py migrate vintasend_django_templates_manager 0001` restores
+the old schema. One case stops it: if any version has been deleted since the upgrade, its history
+records have no version to point at, and the old schema cannot hold them. Rather than delete that
+history, the rollback stops and reports how many such records exist. To roll back anyway, export
+the records with `template=None` (their `template_key` and `version` say what they were about),
+delete them deliberately, and run the rollback again.
 
 ## Composition
 
@@ -180,8 +249,9 @@ template_is_abstract(template, strict=False)  # reads an unparseable template as
 ```
 
 Composition resolves references through this backend, which means an unpinned `{% managed_extends
-"base-email" %}` picks up the **latest** version of that key, draft included — the same rule
-`get_template(key)` follows everywhere else. Pin it with `version=2` when a template has to keep
+"base-email" %}` picks up the **latest** version of that key, draft included — the editing-view
+rule `get_template(key)` follows, not the send path's newest-active rule. So an active template can
+compose against a base's unpublished draft. Pin it with `version=2` when a template has to keep
 composing against an exact base.
 
 Pinning the *notification* rather than the base is vintasend's job, through
