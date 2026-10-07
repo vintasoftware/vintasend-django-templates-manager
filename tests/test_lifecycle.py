@@ -6,6 +6,8 @@ deleted: a record keeps its own key and version, so it is still readable after i
 gone.
 """
 
+from django.db import IntegrityError
+
 import pytest
 from vintasend.services.dataclasses import Notification
 from vintasend.services.notification_template_renderers.base import BaseNotificationTemplateRenderer
@@ -354,6 +356,27 @@ class TestVersionNumbersAreNeverReused:
         assert manager.get_template_status_history("welcome", 4) == []
         strict = DjangoTemplateManager()
         strict.delete_template("welcome", 4)  # a fresh draft, so the rule allows it
+
+    def test_creating_a_key_that_already_exists_is_refused(self, manager, db):
+        manager.create_template(_create_input())
+
+        with pytest.raises(IntegrityError, match="'welcome' already exists"):
+            manager.create_template(_create_input())
+
+        assert list(ManagedTemplate.objects.values_list("version", flat=True)) == [1]
+
+    def test_a_key_whose_first_version_was_deleted_still_exists(self, manager, db):
+        """Creating it again must not hand out v1 a second time -- it would inherit v1's history."""
+        manager.create_template(_create_input())
+        _move(manager, "welcome", 1, [DRAFT], changed_by=None)
+        manager.update_template("welcome", _update_input())
+        manager.delete_template("welcome", 1)
+
+        with pytest.raises(IntegrityError, match="'welcome' already exists"):
+            manager.create_template(_create_input())
+
+        assert list(ManagedTemplate.objects.values_list("version", flat=True)) == [2]
+        assert [e.version for e in manager.get_template_status_history("welcome")] == [1]
 
     def test_numbering_is_unchanged_when_nothing_was_deleted(self, manager, db):
         manager.create_template(_create_input())
