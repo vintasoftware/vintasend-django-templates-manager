@@ -16,8 +16,6 @@ django = "<6.2,>=4.2"
 vintasend = "3.6.0"
 django-model-utils = "^5.0.0"
 vintasend-managed-templates = "3.6.0"
-django-stubs = "^6.0.5"
-ruff = "^0.17.3"
 
 
 [tool.poetry.group.dev.dependencies]
@@ -25,7 +23,8 @@ freezegun = "^1.5.1"
 coverage = "^7.14.1"
 django-stubs = {version = "^6.0.5", extras=["compatible-mypy"]}
 mypy = "^2.3.0"
-tox = "^4.55.0"
+ruff = "^0.17.3"
+tox ="^4.55.0"
 # Makes the [gh] section in tox.ini effective: each CI job then runs only the
 # envs mapped to its interpreter instead of every env it can find one for.
 tox-gh = "^1.8.0"
