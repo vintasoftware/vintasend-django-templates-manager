@@ -66,6 +66,51 @@ so a draft is never sent. A key that exists but has no active version raises
 version whatever its status, for editors and APIs. See
 [Which version a send renders](https://github.com/vintasoftware/vintasend-managed-templates#which-version-a-send-renders).
 
+`service.get_current_template_version(key)` (or the renderer's) is that same version, except that
+it answers `None` for a base, since a base is built on rather than sent. It is what the renderer's
+`get_latest_template_version` returns, so `pin_template_versions` and `repin_notification` never
+pin a notification to a base.
+
+## Previews, sends and the render check
+
+The same rows serve two readers, and they resolve a base or fragment named without `version=`
+differently:
+
+| Composer | An unpinned base resolves to | Used by |
+|---|---|---|
+| The service's (`parts="latest"`) | its newest version, drafts included | `get_composed_template`, `validate_composition`, `render_template`, and this app's admin form check and *composed body* view |
+| The renderer's (`parts="published"`) | its newest `active` version | every send, and `service.render` |
+
+So an editor previews the draft base someone is working on, and a recipient never receives it. A
+base with no `active` version fails a send with `ManagedTemplateCompositionReferenceError`:
+**activate your bases and fragments** along with the templates built on them. To preview either way
+with no notification, pick the rule per call:
+
+```python
+template = service.get_template("welcome")
+service.render_standalone(template, sample_context, parts="latest")  # drafts included
+service.render_standalone(template, sample_context, parts="published")  # what a send renders
+```
+
+To refuse to publish a version that a send could not render, pass a render check:
+
+```python
+from vintasend_managed_templates.managed_template_service import RenderCheck
+
+service.activate("welcome", 3, str(user.pk), check_render=RenderCheck(context=sample_context))
+```
+
+It renders the version with its bases and fragments at their newest published versions, through
+the renderer's composer and inner renderer, before anything is written. A renderer built with
+`composer_parts="latest"` or a custom composer sends against other parts than the check uses. On failure it raises `ManagedTemplateRenderCheckError` (the render
+error is its `__cause__`; the message names the key and version, never the context), and the
+database is untouched: the row keeps its status and no `ManagedTemplateStatusRecord` is created.
+`set_status` takes the same `check_render` for a move to `active`; with any other status it raises
+`ValueError` before a single query runs. The check lives in the service, so this backend needs no
+option for it — and a status changed directly in the admin is not checked, because the admin has
+no context to render with. See
+[Checking a template before it ships](https://github.com/vintasoftware/vintasend-managed-templates#checking-a-template-before-it-ships).
+
 ## Deleting a version
 
 `delete_template` deletes only a version that was **never published**: still `draft`, with nothing
@@ -216,9 +261,9 @@ What this package adds is the editing side:
   field that carries it, rather than a notification that fails to send days later. Set
   `validate_composition = False` on a `ManagedTemplateAdminForm` subclass to save a template whose
   base has not been written yet.
-* **The change form previews the result.** A read-only *composed body* under the content fields
-  shows what the engine will actually receive, resolved against whatever the referenced templates
-  are now.
+* **The change form shows the composed result.** A read-only *composed body* under the content
+  fields shows the template assembled against the newest version of each referenced template now,
+  drafts included: the editing view, not necessarily what the next send receives.
 * **The changelist marks the bases**, and filters on them, through the stored flag below.
 
 ### `is_abstract`
@@ -248,11 +293,13 @@ template_is_abstract(template)  # raises on a malformed tag
 template_is_abstract(template, strict=False)  # reads an unparseable template as concrete
 ```
 
-Composition resolves references through this backend, which means an unpinned `{% managed_extends
-"base-email" %}` picks up the **latest** version of that key, draft included — the editing-view
-rule `get_template(key)` follows, not the send path's newest-active rule. So an active template can
-compose against a base's unpublished draft. Pin it with `version=2` when a template has to keep
-composing against an exact base.
+Composition resolves references through this backend. In the admin and the service's previews,
+an unpinned `{% managed_extends "base-email" %}` picks up the **latest** version of that key, draft
+included — the editing-view rule `get_template(key)` follows. A send picks up the newest
+**active** version instead, the rule the notification's own key follows, so an unpublished draft
+of a base never reaches a recipient; see
+[Previews, sends and the render check](#previews-sends-and-the-render-check). Pin it with
+`version=2` when a template has to keep composing against an exact base.
 
 Pinning the *notification* rather than the base is vintasend's job, through
 `requested_template_version` — see
