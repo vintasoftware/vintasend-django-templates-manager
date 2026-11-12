@@ -189,9 +189,10 @@ class ManagedTemplateAdmin(admin.ModelAdmin):
     def composed_body(self, obj: "ManagedTemplate | None" = None) -> str:
         """The body as the template engine will receive it, every ``managed_*`` tag resolved.
 
-        The point of showing it is that the stored body is only half the template: what
-        actually goes out is this. It resolves against whatever the referenced templates are
-        *now*, so it is a preview of the next send rather than a record of the last one.
+        The point of showing it is that the stored body is only half the template. It is the
+        editing view: it resolves against the newest version of each referenced template *now*,
+        drafts included, through the backend composer. A send composes against published parts
+        instead, so this is neither a preview of the next send nor a record of the last one.
         """
         if obj is None or obj.pk is None:
             return str(_("Save the template to see what it composes to."))
